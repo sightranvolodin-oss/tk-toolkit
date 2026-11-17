@@ -76,9 +76,7 @@ def picked_slots(ob, s):
 # ---------------------------------------------------------------------------
 
 def _select_only(context, objs, active=None):
-    for o in context.view_layer.objects:
-        if o is not None and o.select_get():
-            o.select_set(False)
+    C.deselect_all(context.view_layer)
     for o in objs:
         o.select_set(True)
     context.view_layer.objects.active = active or (objs[0] if objs else None)
@@ -352,8 +350,9 @@ class TK_OT_split_join(bpy.types.Operator):
         objs = [o for o in context.selected_objects if o.type == "MESH"]
         src_name = act.get(SRC_KEY)
         if len(objs) < 2 and src_name:
-            objs = [o for o in context.view_layer.objects
-                    if o.type == "MESH" and o.get(SRC_KEY) == src_name]
+            objs = [o for o in bpy.data.objects
+                    if o.type == "MESH" and o.get(SRC_KEY) == src_name
+                    and o.name in context.view_layer.objects]
         if len(objs) < 2:
             self.report({"WARNING"}, "Выделите хотя бы две части")
             return {"CANCELLED"}

@@ -31,4 +31,6 @@ jobs:
       - name: Run tests
         env:
           PYTHON: python
+          # poison freed memory so use-after-free bugs crash here, not on a user machine
+          MALLOC_PERTURB_: "165"
         run: tests/run_all.sh

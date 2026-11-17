@@ -260,6 +260,34 @@ def enabled_socket(sockets, name):
     return sockets[name]
 
 
+def selected_objects(view_layer=None):
+    """Selected objects, read through bpy.data rather than view_layer.objects.
+
+    Right after bpy.data.objects.remove() inside an operator, Blender 4.x may still keep
+    the removed object's base in view_layer.objects until the layer resyncs; iterating that
+    list then touches freed memory (crash). Object.select_get() looks the base up by the
+    live object instead, which is safe.
+    """
+    vl = view_layer or bpy.context.view_layer
+    out = []
+    for o in bpy.data.objects:
+        try:
+            if o.select_get(view_layer=vl):
+                out.append(o)
+        except (RuntimeError, ReferenceError):
+            pass
+    return out
+
+
+def deselect_all(view_layer=None):
+    vl = view_layer or bpy.context.view_layer
+    for o in selected_objects(vl):
+        try:
+            o.select_set(False, view_layer=vl)
+        except RuntimeError:
+            pass
+
+
 def world_ray_bvh(bvh, m, minv, minv3, origin, direction, max_dist=None):
     """Cast a world-space ray into a BVH built in object-local space.
 

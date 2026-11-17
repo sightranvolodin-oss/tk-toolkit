@@ -285,14 +285,13 @@ class _SceneForBake:
         vl = self.ctx.view_layer
         self.engine = sc.render.engine
         self.cyc_samples = sc.cycles.samples
-        self.sel = [o for o in vl.objects if o is not None and o.select_get()]
+        self.sel = C.selected_objects(vl)
         self.active = vl.objects.active
         self.hidden = self.obj.hide_get()
         self.hide_render = self.obj.hide_render
         sc.render.engine = "CYCLES"
         sc.cycles.samples = self.samples
-        for o in self.sel:
-            o.select_set(False)
+        C.deselect_all(vl)
         self.obj.hide_set(False)
         self.obj.hide_render = False
         self.obj.select_set(True)
