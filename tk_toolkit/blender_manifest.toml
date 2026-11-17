@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "tk_toolkit"
+version = "0.1.0"
+name = "TK Toolkit"
+tagline = "Bake preview, retopology, texture layers, history and more"
+maintainer = "TK Toolkit"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+tags = ["Bake", "Mesh", "Paint", "Modeling", "User Interface"]
+
+[permissions]
+files = "Packs texture layer images into the .blend file"
