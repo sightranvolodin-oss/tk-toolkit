@@ -16,8 +16,11 @@ try:
     ok = True
 except SystemExit:
     ok = True
-except Exception:
+except Exception as ex:
     traceback.print_exc()
+    tb = traceback.extract_tb(ex.__traceback__)
+    where = " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno}" for f in reversed(tb[-4:]))
+    print(f"__TEST_FAIL__ {type(ex).__name__}: {str(ex).splitlines()[-1] if str(ex) else ''} @ {where}")
 if ok:
     print("__TEST_OK__")
 sys.stdout.flush()
