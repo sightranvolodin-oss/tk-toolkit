@@ -1,11 +1,12 @@
 schema_version = "1.0.0"
 
 id = "tk_toolkit"
-version = "0.1.0"
+version = "0.2.0"
 name = "TK Toolkit"
-tagline = "Bake preview, retopology, texture layers, history and more"
+tagline = "Bake preview, retopology, maps & atlas, split by material"
 maintainer = "TK Toolkit"
 type = "add-on"
+website = "https://github.com/sightranvolodin-oss/tk-toolkit"
 
 blender_version_min = "4.2.0"
 
@@ -14,4 +15,5 @@ license = ["SPDX:GPL-3.0-or-later"]
 tags = ["Bake", "Mesh", "Paint", "Modeling", "User Interface"]
 
 [permissions]
-files = "Packs texture layer images into the .blend file"
+files = "Saves baked texture maps and exported parts to disk"
+network = "Checks GitHub releases for add-on updates"

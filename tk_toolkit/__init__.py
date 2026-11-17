@@ -1,4 +1,5 @@
-"""TK Toolkit — bake preview, retopology, texture layers, readable history,
+"""TK Toolkit — bake preview, retopology, texture maps & atlas, split by material,
+texture layers, readable history,
 scene profiler, precision tools and artist-friendly Geometry Nodes tools.
 
 Sidebar (N) → tab «Toolkit».
@@ -7,23 +8,25 @@ Sidebar (N) → tab «Toolkit».
 bl_info = {
     "name": "TK Toolkit",
     "author": "TK Toolkit",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport → Sidebar (N) → Toolkit",
-    "description": "Bake preview, retopology, texture layers, readable history and more",
+    "description": "Bake preview, retopology, texture maps & atlas, split by material, layers and more",
     "category": "3D View",
 }
 
 if "bpy" in locals():
     import importlib
-    for _m in (common, bake_preview, retopo, layers, history, profiler, precision, gn_tools):  # noqa: F821
+    for _m in (common, bake_preview, retopo, layers, maps, split, history, profiler, precision, gn_tools, updater):  # noqa: F821
         importlib.reload(_m)
 else:
-    from . import common, bake_preview, retopo, layers, history, profiler, precision, gn_tools
+    from . import (common, bake_preview, retopo, layers, maps, split, history, profiler,
+                   precision, gn_tools, updater)
 
 import bpy  # noqa: E402
 
-modules = (bake_preview, retopo, layers, history, profiler, precision, gn_tools)
+modules = (bake_preview, retopo, layers, maps, split, history, profiler, precision, gn_tools,
+           updater)
 
 
 def register():

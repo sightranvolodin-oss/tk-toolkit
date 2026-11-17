@@ -1,0 +1,34 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: System libraries for Blender
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxi6 libxkbcommon0 libsm6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libegl1
+
+      - name: Blender 4.5 as a Python module
+        run: pip install "bpy>=4.5,<4.6" numpy
+
+      - name: Byte-compile
+        run: python -m compileall -q tk_toolkit
+
+      - name: Run tests
+        env:
+          PYTHON: python
+        run: tests/run_all.sh

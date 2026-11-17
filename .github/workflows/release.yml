@@ -1,0 +1,47 @@
+name: Release
+
+# Push a tag like v0.2.0 → this builds tk_toolkit-0.2.0.zip and publishes a GitHub release.
+# The version in the tag must match tk_toolkit/blender_manifest.toml.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          MANIFEST=$(sed -n 's/^version = "\(.*\)"/\1/p' tk_toolkit/blender_manifest.toml)
+          if [ "$TAG" != "$MANIFEST" ]; then
+            echo "Tag $TAG does not match manifest version $MANIFEST"; exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build extension zip
+        run: |
+          cd tk_toolkit
+          zip -r "../tk_toolkit-${{ steps.ver.outputs.version }}.zip" . -x "__pycache__/*" "*.pyc"
+
+      - name: Release notes from CHANGELOG
+        run: |
+          awk -v v="${{ steps.ver.outputs.version }}" '
+            $0 ~ "^## " v { on=1; next }
+            /^## / && on { exit }
+            on { print }' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "TK Toolkit ${{ steps.ver.outputs.version }}" > notes.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "tk_toolkit-${{ steps.ver.outputs.version }}.zip" \
+            --title "TK Toolkit ${{ steps.ver.outputs.version }}" --notes-file notes.md
