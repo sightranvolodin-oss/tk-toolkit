@@ -15,6 +15,13 @@ for t in t_ui t_split t_maps t_atlas_check t_all t_bake t_layers t_modes t_retop
     fail=1
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
       line=$(echo "$out" | grep -m1 "__TEST_FAIL__" | sed 's/%/%25/g')
+      if [ -z "$line" ]; then
+        line=$(echo "$out" | grep -A12 -m1 "Fatal Python error" | grep -E "Fatal|File " \
+               | sed -e 's/^ *//' -e 's/%/%25/g' | tr '\n' ' ' | cut -c1-900)
+      fi
+      if [ -z "$line" ]; then
+        line="crash: $(echo "$out" | grep -v -i "unfreed\|leak detector\|^$\|Baking map\|^Info" | tail -3 | tr '\n' ' ' | cut -c1-600)"
+      fi
       echo "::error title=$t failed::${line:-no __TEST_OK__ (crash?) exit $rc}"
     fi
   fi

@@ -7,6 +7,9 @@ import os
 import runpy
 import sys
 import traceback
+import faulthandler
+
+faulthandler.enable()
 
 ok = False
 try:
