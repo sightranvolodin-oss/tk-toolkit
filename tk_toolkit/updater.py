@@ -78,6 +78,38 @@ def check(repo):
     return parse_version(_state["latest"]) > parse_version(current_version())
 
 
+_pending = {"path": None, "pkg": None, "version": None}
+
+
+def _install_zip(path, pkg):
+    if pkg.startswith("bl_ext."):
+        repo_module = pkg.split(".")[1]
+        try:
+            bpy.ops.extensions.package_install_files(
+                filepath=path, repo=repo_module, enable_on_install=True, overwrite=True)
+        except TypeError:
+            bpy.ops.extensions.package_install_files(
+                filepath=path, repo=repo_module, enable_on_install=True)
+    else:
+        bpy.ops.preferences.addon_install(filepath=path, overwrite=True)
+        bpy.ops.preferences.addon_enable(module=pkg)
+
+
+def _run_pending():
+    """Timer: install the downloaded zip. Touches no bpy struct of this module afterwards,
+    because the install unregisters and re-imports the add-on."""
+    path, pkg, ver = _pending["path"], _pending["pkg"], _pending["version"]
+    _pending.update(path=None, pkg=None, version=None)
+    if not path:
+        return None
+    try:
+        _install_zip(path, pkg)
+        print(f"[TK Toolkit] Установлена версия {ver}. Перезапустите Blender для чистой загрузки.")
+    except Exception as ex:
+        print("[TK Toolkit] Не удалось установить обновление:", ex)
+    return None
+
+
 class TK_OT_update_check(bpy.types.Operator):
     bl_idname = "tk.update_check"
     bl_label = "Проверить обновления"
@@ -120,19 +152,13 @@ class TK_OT_update_install(bpy.types.Operator):
         except Exception as ex:
             self.report({"ERROR"}, f"Не удалось скачать: {ex}")
             return {"CANCELLED"}
-        pkg = addon_package()
-        if pkg.startswith("bl_ext."):
-            repo_module = pkg.split(".")[1]
-            try:
-                bpy.ops.extensions.package_install_files(
-                    filepath=tmp, repo=repo_module, enable_on_install=True, overwrite=True)
-            except TypeError:
-                bpy.ops.extensions.package_install_files(
-                    filepath=tmp, repo=repo_module, enable_on_install=True)
-        else:
-            bpy.ops.preferences.addon_install(filepath=tmp, overwrite=True)
-        self.report({"INFO"}, f"Установлена версия {_state['latest']}. "
-                              "Перезапустите Blender, чтобы всё обновилось начисто")
+        # Installing re-registers the add-on, which frees this very operator class.
+        # So the install runs from a timer, after this operator has returned.
+        _pending["path"] = tmp
+        _pending["pkg"] = addon_package()
+        _pending["version"] = _state["latest"]
+        bpy.app.timers.register(_run_pending, first_interval=0.1)
+        self.report({"INFO"}, f"Устанавливаю версию {_state['latest']}…")
         return {"FINISHED"}
 
 
