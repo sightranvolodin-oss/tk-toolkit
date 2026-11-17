@@ -40,5 +40,6 @@ PYTHON=python tests/run_all.sh          # все тесты
 
 1. Поднимите `version` в `tk_toolkit/blender_manifest.toml` (и `bl_info` в `__init__.py`).
 2. Опишите изменения в `CHANGELOG.md` под заголовком `## X.Y.Z`.
-3. `git tag vX.Y.Z && git push origin main vX.Y.Z` — GitHub Actions соберёт zip и создаст
-   релиз, а у пользователей кнопка «Проверить обновления» его увидит.
+3. Запушьте в `main` — GitHub Actions увидит новую версию, соберёт zip и создаст релиз
+   `vX.Y.Z`, а кнопка «Проверить обновления» в Blender его найдёт. Релиз можно запустить
+   и вручную: вкладка *Actions → Release → Run workflow*.

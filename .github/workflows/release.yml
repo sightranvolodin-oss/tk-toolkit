@@ -1,11 +1,14 @@
 name: Release
 
-# Push a tag like v0.2.0 → this builds tk_toolkit-0.2.0.zip and publishes a GitHub release.
-# The version in the tag must match tk_toolkit/blender_manifest.toml.
+# Raise `version` in tk_toolkit/blender_manifest.toml and push to main: if there is no
+# release vX.Y.Z yet, this builds tk_toolkit-X.Y.Z.zip and publishes the release
+# (the tag is created by the release). It can also be started by hand from the Actions tab.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: ["tk_toolkit/blender_manifest.toml", ".github/workflows/release.yml"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,22 +19,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check version
+      - name: Read version
         id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          MANIFEST=$(sed -n 's/^version = "\(.*\)"/\1/p' tk_toolkit/blender_manifest.toml)
-          if [ "$TAG" != "$MANIFEST" ]; then
-            echo "Tag $TAG does not match manifest version $MANIFEST"; exit 1
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' tk_toolkit/blender_manifest.toml)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "Release v$V already exists — nothing to do"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Build extension zip
+        if: steps.ver.outputs.exists != 'true'
         run: |
           cd tk_toolkit
           zip -r "../tk_toolkit-${{ steps.ver.outputs.version }}.zip" . -x "__pycache__/*" "*.pyc"
 
       - name: Release notes from CHANGELOG
+        if: steps.ver.outputs.exists != 'true'
         run: |
           awk -v v="${{ steps.ver.outputs.version }}" '
             $0 ~ "^## " v { on=1; next }
@@ -40,8 +47,11 @@ jobs:
           [ -s notes.md ] || echo "TK Toolkit ${{ steps.ver.outputs.version }}" > notes.md
 
       - name: Publish release
+        if: steps.ver.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "tk_toolkit-${{ steps.ver.outputs.version }}.zip" \
+          gh release create "v${{ steps.ver.outputs.version }}" \
+            "tk_toolkit-${{ steps.ver.outputs.version }}.zip" \
+            --target "$GITHUB_SHA" \
             --title "TK Toolkit ${{ steps.ver.outputs.version }}" --notes-file notes.md
