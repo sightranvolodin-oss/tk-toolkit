@@ -220,9 +220,11 @@ class _MatPatch:
         self.prev_active_out = None
         self.prev_active = self.nt.nodes.active
         kind = CHANNELS[ch][4]
-        img_node = self._add("ShaderNodeTexImage")
-        img_node.image = image
-        img_node.location = (-2000, 2000)
+        img_node = None
+        if image is not None:  # None: only rewire (source of a selected-to-active bake)
+            img_node = self._add("ShaderNodeTexImage")
+            img_node.image = image
+            img_node.location = (-2000, 2000)
         if kind == "EMIT":
             src = channel_source(mat, ch)
             em = self._add("ShaderNodeEmission")
@@ -244,10 +246,11 @@ class _MatPatch:
             self.prev_active_out = output_node(self.nt)
             self.nt.links.new(em.outputs[0], out.inputs["Surface"])
             out.is_active_output = True
-        for n in self.nt.nodes:
-            n.select = False
-        img_node.select = True
-        self.nt.nodes.active = img_node
+        if img_node is not None:
+            for n in self.nt.nodes:
+                n.select = False
+            img_node.select = True
+            self.nt.nodes.active = img_node
 
     def _add(self, idname):
         n = self.nt.nodes.new(idname)
@@ -275,10 +278,11 @@ class _MatPatch:
 class _SceneForBake:
     """Cycles + selection set up for baking one object; restored on exit."""
 
-    def __init__(self, context, obj, samples=1):
+    def __init__(self, context, obj, samples=1, extra=()):
         self.ctx = context
         self.obj = obj
         self.samples = samples
+        self.extra = list(extra)
 
     def __enter__(self):
         sc = self.ctx.scene
@@ -294,6 +298,11 @@ class _SceneForBake:
         C.deselect_all(vl)
         self.obj.hide_set(False)
         self.obj.hide_render = False
+        self.extra_hidden = [(o, o.hide_get(), o.hide_render) for o in self.extra]
+        for o in self.extra:
+            o.hide_set(False)
+            o.hide_render = False
+            o.select_set(True)
         self.obj.select_set(True)
         vl.objects.active = self.obj
         return self
@@ -309,6 +318,13 @@ class _SceneForBake:
             self.obj.hide_render = self.hide_render
         except ReferenceError:
             pass
+        for o, h, hr in self.extra_hidden:
+            try:
+                o.select_set(False)
+                o.hide_set(h)
+                o.hide_render = hr
+            except ReferenceError:
+                pass
         for o in self.sel:
             try:
                 o.select_set(True)
