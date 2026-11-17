@@ -14,10 +14,9 @@ for t in t_ui t_split t_maps t_atlas_check t_all t_bake t_layers t_modes t_retop
     echo "!!! $t FAILED (exit code $rc)"
     fail=1
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
-      echo "$out" | grep -v -i "unfreed\|leak detector\|^$" | tail -12 | while IFS= read -r line; do
-        echo "::error title=$t::${line}"
-      done
-      echo "::error title=$t::exit code $rc"
+      msg=$(echo "$out" | grep -v -i "unfreed\|leak detector\|^$\|^Info:\|Baking map" | tail -30 \
+            | sed -e 's/%/%25/g' -e 's/\r//g' | awk '{printf "%s%%0A", $0}')
+      echo "::error title=$t failed::${msg}"
     fi
   fi
 done
