@@ -7,15 +7,17 @@ cd "$(dirname "$0")"
 fail=0
 for t in t_ui t_split t_maps t_atlas_check t_all t_bake t_layers t_modes t_retopo; do
   echo "=== $t"
-  out=$(timeout 900 "$PY" run.py "$t.py" 2>&1)
+  out=$(timeout 900 "$PY" run.py "$t.py" 2>&1 | grep -v "^Fra:")
+  rc=${PIPESTATUS[0]}
   echo "$out" | grep -v -i "unfreed\|leak detector\|^$" | tail -25
   if ! echo "$out" | grep -q "__TEST_OK__" || echo "$out" | grep -q -E "Traceback|Error: Python"; then
-    echo "!!! $t FAILED"
+    echo "!!! $t FAILED (exit code $rc)"
     fail=1
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
-      echo "$out" | grep -v -i "unfreed\|leak detector\|^$" | tail -8 | while IFS= read -r line; do
+      echo "$out" | grep -v -i "unfreed\|leak detector\|^$" | tail -12 | while IFS= read -r line; do
         echo "::error title=$t::${line}"
       done
+      echo "::error title=$t::exit code $rc"
     fi
   fi
 done
