@@ -97,6 +97,14 @@ class TK_CardSettings(bpy.types.PropertyGroup):
         ("HIDE", "Скрыть", ""), ("DELETE", "Удалить", ""), ("KEEP", "Оставить", "")],
         default="HIDE")
     save_files: BoolProperty(name="Сохранить текстуры в папку", default=False)
+    batch_rest: EnumProperty(
+        name="Остатки",
+        items=[("AUTO", "Авто", "НПМ — убрать, ВПМ — оставить геометрией"),
+               ("KEEP", "Оставить", "То, что не стало карточками (одиночные стойки, плиты, "
+                                    "кронштейны), остаётся отдельным объектом «_остаток»"),
+               ("DELETE", "Убрать", "Не создавать «_остаток». Исходный меш не удаляется — "
+                                    "он остаётся в сцене скрытым")],
+        default="AUTO")
     output_dir: StringProperty(name="Папка", subtype="DIR_PATH", default="//textures/")
     file_format: EnumProperty(name="Формат", items=[
         ("PNG", "PNG", ""), ("TARGA", "TGA", ""), ("TIFF", "TIFF", "")], default="PNG")
@@ -357,14 +365,19 @@ def top_profile(pu, pz, u0, u1, cell=0.05, tol=0.03):
     top = _ends(_opening(_closing(top, gap), spike), spike)
     bot = _ends(_closing(_opening(bot, gap), spike), spike)
     band = top - bot
-    bh = float(np.median(band))
+    # stretches where only the handrail runs (over a landing, without bars below) have
+    # no band at all: judge the band where it exists, the profile comes from the top
+    full = band > 0.4 * float(np.percentile(band, 90))
+    if full.mean() < 0.4:
+        return None
+    bh = float(np.median(band[full]))
     need = max(0.1, 0.25 * bh)
-    if bh <= 0 or float(np.ptp(top)) < need or float(np.ptp(bot)) < need:
+    if bh <= 0 or float(np.ptp(top)) < need or float(np.ptp(bot[full])) < need:
         return None                            # practically flat
     # most of the length must keep the band height (end gates / single posts may not)
-    if float(np.percentile(np.abs(band - bh), 75)) > 0.1 * bh:
+    if float(np.percentile(np.abs(band[full] - bh), 75)) > 0.1 * bh:
         return None                            # the band doesn't keep its height
-    dt, db = top - top.mean(), bot - bot.mean()
+    dt, db = top[full] - top[full].mean(), bot[full] - bot[full].mean()
     if dt.std() == 0 or db.std() == 0 or float(np.corrcoef(dt, db)[0, 1]) < 0.85:
         return None                            # top and bottom don't rise together
     xs = np.concatenate([[u0], xs, [u1]])
@@ -531,7 +544,7 @@ def piece_geometry(info, pieces, area, tile, d):
     return verts, faces, uvf, uva
 
 
-def joined_copy(context, items, name="TK_npm_sources"):
+def joined_copy(context, items, name="TK_npm_sources", offsets=None):
     """One object holding world-space copies of all *items* [(obj, info|None)] — when info
     has a profile the copy is straightened. Cycles' selected-to-active casts rays against
     every selected object separately, so one joined object bakes many times faster."""
@@ -550,6 +563,8 @@ def joined_copy(context, items, name="TK_npm_sources"):
             if inf is not None and inf.get("profile") is not None:
                 bu, bz = inf["profile"]
                 co -= np.interp(co @ np.array(inf["u"]), bu, bz)[:, None] * np.array(inf["z"])[None, :]
+            if offsets is not None:
+                co += np.asarray(offsets[len(cos)])[None, :]
             lv = np.empty(nl, np.int64); me.loops.foreach_get("vertex_index", lv)
             ls = np.empty(npo, np.int64); me.polygons.foreach_get("loop_start", ls)
             lt = np.empty(npo, np.int64); me.polygons.foreach_get("loop_total", lt)
@@ -589,6 +604,10 @@ def joined_copy(context, items, name="TK_npm_sources"):
     ob = bpy.data.objects.new(name, me)
     context.scene.collection.objects.link(ob)
     return ob
+
+
+def thick_of(chunk):
+    return max(pr[4][1]["thickness"] for pr in chunk)
 
 
 def mesh_from(name, verts, faces, uvs):
@@ -1913,6 +1932,7 @@ class TK_PT_cards(bpy.types.Panel):
         col = box.column(align=True)
         col.scale_y = 1.2
         col.operator("tk.card_batch", icon="MOD_ARRAY")
+        box.prop(s, "batch_rest")
         if _last_batch:
             box.label(text=f"Веток {_last_batch['runs']}, карточек {_last_batch['cards']}, "
                            f"типов {len(_last_batch.get('types', []))}, "
@@ -2023,7 +2043,10 @@ class TK_OT_card_batch(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     min_length: FloatProperty(name="Короче — оставить геометрией", default=1.0, min=0.0,
-                              subtype="DISTANCE")
+                              subtype="DISTANCE",
+                              description="Ветки короче остаются геометрией. Если не задано: "
+                                          "ВПМ — 1 м, НПМ — 0,25 м (НПМ запекает ветку целиком, "
+                                          "ей повтор не нужен)")
     join: BoolProperty(name="Собрать карточки в один объект", default=True)
     max_types: bpy.props.IntProperty(name="Максимум типов перил (текстур)", default=6, min=1,
                                      max=16)
@@ -2045,6 +2068,8 @@ class TK_OT_card_batch(bpy.types.Operator):
         coll = srcs[0].users_collection[0] if srcs[0].users_collection else context.scene.collection
         run_objs, leftovers = [], []
         self._srcs = list(srcs)
+        min_len = (self.min_length if self.properties.is_property_set("min_length")
+                   else (0.25 if s.model_type == "NPM" else 1.0))
         for si, src in enumerate(srcs):
             yield 0.02, f"Разбор меша {src.name} на ветки…"
             me = src.data
@@ -2064,7 +2089,7 @@ class TK_OT_card_batch(bpy.types.Operator):
             part_run = np.array([p.run for p in parts])
             keep = np.zeros(len(parts), bool)        # parts that stay geometry
             for i, r in enumerate(runs):
-                if r["u1"] - r["u0"] < self.min_length:
+                if r["u1"] - r["u0"] < min_len:
                     keep[[p.idx for p in r["parts"]]] = True
                     continue
                 sub = RU.submesh(me, part_run[plab] == i, f"{src.name}_run{i}", mcache)
@@ -2180,7 +2205,10 @@ class TK_OT_card_batch(bpy.types.Operator):
             mask = keepmask.copy() if keepmask is not None else np.zeros(len(src.data.polygons), bool)
             for ri in failed_ids.get(src.name, []):
                 mask |= part_run[plab] == ri
-            if mask.any():
+            drop = s.batch_rest == "DELETE" or (s.batch_rest == "AUTO" and s.model_type == "NPM")
+            if mask.any() and drop:
+                self._dropped = getattr(self, "_dropped", 0) + int(mask.sum())
+            elif mask.any():
                 me2 = RU.submesh(src.data, mask, f"{src.name}_остаток", mcache)
                 ro = bpy.data.objects.new(f"{src.name}_остаток", me2)
                 ro.matrix_world = src.matrix_world
@@ -2213,14 +2241,18 @@ class TK_OT_card_batch(bpy.types.Operator):
         context.view_layer.objects.active = result[0]
         tri = sum(len(c.data.polygons) for c in result)
         rest = sum(len(c.data.polygons) for c in rest_objs)
+        dropped = getattr(self, "_dropped", 0)
+        self._dropped = 0
         _last_batch.update(runs=len(run_objs), cards=len(cards), failed=list(failed),
-                           card_polys=tri, rest_polys=rest,
+                           card_polys=tri, rest_polys=rest, dropped_polys=dropped,
                            types=[(g["atlas"], g["n"], round(g["H"], 2)) for g in groups])
         msg = (f"Веток: {len(run_objs)}, карточек: {len(cards)}, типов перил: {len(groups)}, "
                f"полигонов в карточках: {tri}; "
                f"оставлено геометрией: {rest} полигонов")
+        if dropped:
+            msg += f"; мелкие остатки убраны ({dropped} полигонов, исходник скрыт в сцене)"
         if failed:
-            msg += f"; не подошли {len(failed)} (оставлены геометрией)"
+            msg += f"; не подошли {len(failed)}" + ("" if dropped else " (оставлены геометрией)")
         self.report({"INFO"}, msg)
         self._result = {"FINISHED"}
 
@@ -2253,9 +2285,8 @@ class TK_OT_card_batch(bpy.types.Operator):
             return cards, failed
         groups.append({"atlas": s.atlas_name, "n": 0, "H": max(t[2] for t in items)})
         by_name = {o.name: (o, r, src, i) for o, r, src, i in run_objs}
-        # 1) every run: its card (final) and its quads on one common bake target
-        tv, tf, tuv = [], [], []
-        sources, temps, thick = [], [], 0.0
+        # 1) every run: its card (final) and its quads for the bake target
+        per_run = []                      # (key, verts, faces, uv_area, (obj, info), polys)
         acc = None
         try:
             for j, (key, _L, _H) in enumerate(items):
@@ -2265,10 +2296,6 @@ class TK_OT_card_batch(bpy.types.Operator):
                            f"НПМ {d:.1f} px/м: раскладка веток в четверть {j + 1}/{len(items)}")
                 _H, inf, _p = quick[key]
                 verts, faces, uvf, uva = piece_geometry(inf, placed[key], area, tile, d)
-                k0 = len(tv)
-                tv += verts
-                tf += [tuple(k0 + q for q in f) for f in faces]
-                tuv += uva
                 eps = max(1e-4, inf["thickness"] * 0.02)
                 shift = np.array(inf["n"]) * (inf.get("n_card", (inf["n0"] + inf["n1"]) / 2)
                                               - (inf["n1"] + eps))
@@ -2278,45 +2305,87 @@ class TK_OT_card_batch(bpy.types.Operator):
                 coll.objects.link(card)
                 if inf["profile"] is not None:
                     warp_to_profile(card, inf)
-                sources.append((o, inf))
-                thick = max(thick, inf["thickness"])
+                per_run.append((key, verts, faces, uva, (o, inf), len(o.data.polygons)))
                 cards.append(card)
                 self._made.append(card)
                 card["tk_card_density"] = d
                 groups[0]["n"] += 1
-            # 2) one bake for all runs (per channel), instead of one per run
-            tme = mesh_from("TK_npm_bake", tv, tf, tuv)
-            tmat = bpy.data.materials.new("TK_card_bake")
-            try:
-                tmat.use_nodes = True
-            except Exception:
-                pass
-            tme.materials.append(tmat)
-            target = bpy.data.objects.new("TK_npm_bake", tme)
-            coll.objects.link(target)
-            yield 0.42, f"НПМ: сборка {len(sources)} веток в один объект для запекания…"
-            joined = joined_copy(context, sources)
-            temps.append(joined)
-            sources = [joined]
-            try:
-                gen = bake_area(context, s, sources, target, area, d, thick)
-                while True:
+            # 2) bake many runs at once (Cycles casts against every selected object
+            # separately, so they are joined into one), in chunks that fit in memory
+            LIMIT = 1_200_000
+            chunks, cur, npo = [], [], 0
+            for pr in per_run:
+                if cur and npo + pr[5] > LIMIT:
+                    chunks.append(cur)
+                    cur, npo = [], 0
+                cur.append(pr)
+                npo += pr[5]
+            if cur:
+                chunks.append(cur)
+            g = GUTTER // 2
+            for ci, chunk in enumerate(chunks):
+                tv, tf, tuv = [], [], []
+                # every run is moved far from the others for the bake: one bake pass,
+                # but rays from a card only ever reach its own railing (neighbours that
+                # pass close by — a stair next to a fence — don't get baked in)
+                offs = [(0.0, 0.0, 10000.0 * (q + 1)) for q in range(len(chunk))]
+                for q, (key, verts, faces, uva, _src, _n) in enumerate(chunk):
+                    k0 = len(tv)
+                    oz = offs[q][2]
+                    verts = [(v[0], v[1], v[2] + oz) for v in verts]
+                    tv += verts
+                    tf += [tuple(k0 + q for q in f) for f in faces]
+                    tuv += uva
+                part = f" (часть {ci + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+                yield 0.42 + 0.45 * ci / len(chunks), f"НПМ: сборка веток для запекания{part}…"
+                joined = joined_copy(context, [pr[4] for pr in chunk], offsets=offs)
+                for pr in chunk:                     # their geometry is in the joined copy
+                    o_ = pr[4][0]
                     try:
-                        ch = next(gen)
-                    except StopIteration as st:
-                        acc = st.value
-                        break
-                    yield 0.45, f"НПМ: запекание «{ch}» сразу для {len(items)} веток…"
-            finally:
-                bpy.data.objects.remove(target)
-                bpy.data.meshes.remove(tme)
-                bpy.data.materials.remove(tmat)
+                        me_ = o_.data
+                        bpy.data.objects.remove(o_)
+                        if me_.users == 0:
+                            bpy.data.meshes.remove(me_)
+                    except ReferenceError:
+                        pass
+                tme = mesh_from("TK_npm_bake", tv, tf, tuv)
+                tmat = bpy.data.materials.new("TK_card_bake")
+                try:
+                    tmat.use_nodes = True
+                except Exception:
+                    pass
+                tme.materials.append(tmat)
+                target = bpy.data.objects.new("TK_npm_bake", tme)
+                coll.objects.link(target)
+                try:
+                    gen = bake_area(context, s, [joined], target, area, d, thick_of(chunk))
+                    while True:
+                        try:
+                            ch = next(gen)
+                        except StopIteration as st:
+                            crop = st.value
+                            break
+                        yield (0.45 + 0.45 * ci / len(chunks),
+                               f"НПМ: запекание «{ch}» сразу для {len(chunk)} веток{part}…")
+                finally:
+                    bpy.data.objects.remove(target)
+                    bpy.data.meshes.remove(tme)
+                    bpy.data.materials.remove(tmat)
+                    jm = joined.data
+                    bpy.data.objects.remove(joined)
+                    bpy.data.meshes.remove(jm)
+                if acc is None:
+                    acc = {ch: np.zeros_like(a) for ch, a in crop.items()}
+                for pr in chunk:
+                    for (_ua, _ub, _za, _zb, _t, px, py, w, h) in placed[pr[0]]:
+                        ys = slice(max(0, py - g), min(ah, py + h + g))
+                        xs = slice(max(0, px - g), min(aw, px + w + g))
+                        for ch, a in crop.items():
+                            if ch in acc:
+                                acc[ch][ys, xs] = a[ys, xs]
+                crop = None
         finally:
-            for t in temps:
-                me_ = t.data
-                bpy.data.objects.remove(t)
-                if me_.users == 0:
-                    bpy.data.meshes.remove(me_)
+            pass
         if not acc:
             return cards, failed
         yield 0.92, "НПМ: доводка карт и запись атласа…"
@@ -2362,9 +2431,11 @@ class TK_OT_card_batch(bpy.types.Operator):
                 pass
 
     def execute(self, context):
+        dbg = os.environ.get("TK_DBG")
         try:
-            for _ in self._steps(context):
-                pass
+            for frac, text in self._steps(context):
+                if dbg:
+                    print(f"STEP {int(frac * 100)}% {text}", flush=True)
         except Exception:
             self.cleanup()
             raise

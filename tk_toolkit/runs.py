@@ -215,12 +215,56 @@ def split_runs(lines, gap=0.15):
     return runs
 
 
+def bar_rows(left, runs, step_max=0.35, min_bars=3):
+    """Rows of loose vertical bars with no rail of their own (a grille, a screen): they
+    are not on any line, so group them by plan position — neighbours closer than
+    *step_max*, at the same height, on one straight line → a run of their own."""
+    vert = [p for p in left
+            if (p.zmax - p.zmin) > 3 * max(np.ptp(p.pts[:, 0]), np.ptp(p.pts[:, 1]), 1e-6)]
+    if len(vert) < min_bars:
+        return left
+    C = np.array([[p.center[0], p.center[1], 0.5 * (p.zmin + p.zmax)] for p in vert])
+    n = len(vert)
+    a, b = [], []
+    for i in range(n):                                  # small n (leftovers only)
+        d = np.linalg.norm(C[:, :2] - C[i, :2], axis=1)
+        m = (d < step_max) & (np.abs(C[:, 2] - C[i, 2]) < 0.3) & (np.arange(n) > i)
+        js = np.nonzero(m)[0]
+        a += [i] * len(js)
+        b += js.tolist()
+    lab = components(n, np.array(a, np.int64), np.array(b, np.int64))
+    used = set()
+    for r in range(int(lab.max()) + 1 if n else 0):
+        idx = np.nonzero(lab == r)[0]
+        if len(idx) < min_bars:
+            continue
+        P = C[idx, :2]
+        c = P.mean(0)
+        _, sv, vt = np.linalg.svd(P - c)
+        d_ = vt[0]
+        if sv[0] < 1e-6 or (len(sv) > 1 and sv[1] > 0.05 * sv[0] + 0.02):
+            continue                                    # not a straight row
+        nrm = np.array([-d_[1], d_[0]])
+        members = [vert[i] for i in idx]
+        us = np.concatenate([m.pts[:, :2] @ d_ for m in members])
+        run = {"line": -1, "dir": d_, "nrm": nrm, "parts": members,
+               "u0": float(us.min()), "u1": float(us.max()),
+               "z0": min(m.zmin for m in members), "z1": max(m.zmax for m in members)}
+        k = len(runs)
+        runs.append(run)
+        for m in members:
+            m.run = k
+            used.add(id(m))
+    return [p for p in left if id(p) not in used]
+
+
 def analyse_mesh(W, me):
     lab, n = mesh_loose_parts(me)
     parts = describe_parts(W, lab, n)
     lines = find_lines(parts)
     left = attach_small(parts, lines)
     runs = split_runs(lines)
+    left = bar_rows(left, runs)
     return lab, parts, lines, runs, left
 
 
