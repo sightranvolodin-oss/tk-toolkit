@@ -91,7 +91,7 @@ class TK_CardSettings(bpy.types.PropertyGroup):
     threshold: FloatProperty(name="Порог альфы", default=0.5, min=0.0, max=1.0)
     binary_mask: BoolProperty(name="Жёсткая маска (0/1)", default=True,
                               description="Opacity строго чёрно-белая. Для НПМ порог снижается до "
-                                          "0.25, чтобы тонкие стойки стали сплошным пикселем")
+                                          "0.4, чтобы тонкие стойки стали сплошным пикселем")
 
     atlas_name: StringProperty(name="Атлас", default="Cards",
                                description="Имя набора текстур; карточки с одним именем делят тайл")
@@ -943,7 +943,7 @@ def finish_maps(crop, s):
     op = crop["OPACITY"][..., 0]
     # НПМ: a thin bar is under a pixel and bakes half-transparent — a low threshold keeps
     # it as a solid pixel instead of losing it
-    thr = min(s.threshold, 0.25) if s.model_type == "NPM" else s.threshold
+    thr = min(s.threshold, 0.4) if s.model_type == "NPM" else s.threshold
     if s.bleed and "DIFFUSE" in crop:
         d = crop["DIFFUSE"]
         d[..., :3] = M.bleed_colors(d[..., :3], op >= thr, int(s.bleed_px))
@@ -2099,12 +2099,52 @@ class TK_OT_card_batch(bpy.types.Operator):
             me.loops.foreach_get("vertex_index", lv)
             plab = lab[lv[ls_]]
             part_run = np.array([p.run for p in parts])
+            part_line = np.array([p.line for p in parts])
+            # polygon centres (world) and materials: a handrail bent around a corner is ONE
+            # part but belongs to two runs — each run also takes the polygons of other
+            # parts that lie in its own plane
+            lt_ = np.empty(npoly, np.int64)
+            me.polygons.foreach_get("loop_total", lt_)
+            pc = np.add.reduceat(W[lv], ls_, axis=0) / lt_[:, None]
+            pmi = np.empty(npoly, np.int64)
+            me.polygons.foreach_get("material_index", pmi)
             keep = np.zeros(len(parts), bool)        # parts that stay geometry
             for i, r in enumerate(runs):
                 if r["u1"] - r["u0"] < min_len:
                     keep[[p.idx for p in r["parts"]]] = True
                     continue
-                sub = RU.submesh(me, part_run[plab] == i, f"{src.name}_run{i}", mcache)
+                own = part_run[plab] == i
+                d2, n2 = np.asarray(r["dir"]), np.asarray(r["nrm"])
+                ownc = pc[own]
+                off = float(np.median(ownc[:, :2] @ n2)) if len(ownc) else 0.0
+                uu = pc[:, :2] @ d2
+                band = ((np.abs(pc[:, :2] @ n2 - off) < 0.06)
+                        & (uu > r["u0"] - 0.05) & (uu < r["u1"] + 0.05)
+                        & (pc[:, 2] > r["z0"] - 0.2) & (pc[:, 2] < r["z1"] + 0.3))
+                if len(ownc):
+                    mats = np.unique(pmi[own])
+                    band &= np.isin(pmi, mats)
+                # only parts of OTHER lines (a bent handrail); railings of other floors
+                # on this same line stay theirs
+                band &= part_line[plab] != r.get("line", -2)
+                # …and only at the height of this run's own geometry at that spot (a sloped
+                # run's bounding box would reach the floors above and below)
+                if len(ownc) and band.any():
+                    ou = ownc[:, :2] @ d2
+                    b0 = float(r["u0"]) - 0.1
+                    nb_ = int((float(r["u1"]) + 0.1 - b0) / 0.25) + 1
+                    ob = np.clip(((ou - b0) / 0.25).astype(int), 0, nb_ - 1)
+                    zlo = np.full(nb_, np.inf)
+                    zhi = np.full(nb_, -np.inf)
+                    np.minimum.at(zlo, ob, ownc[:, 2])
+                    np.maximum.at(zhi, ob, ownc[:, 2])
+                    cand = np.nonzero(band)[0]
+                    cb = np.clip(((uu[cand] - b0) / 0.25).astype(int), 0, nb_ - 1)
+                    lo_ = np.minimum(zlo[cb], zlo[np.clip(cb - 1, 0, nb_ - 1)])
+                    hi_ = np.maximum(zhi[cb], zhi[np.clip(cb + 1, 0, nb_ - 1)])
+                    ok = (pc[cand, 2] > lo_ - 0.1) & (pc[cand, 2] < hi_ + 0.15)
+                    band[cand[~ok]] = False
+                sub = RU.submesh(me, own | band, f"{src.name}_run{i}", mcache)
                 o = bpy.data.objects.new(f"{src.name}_run{i}", sub)
                 o.matrix_world = src.matrix_world
                 context.scene.collection.objects.link(o)
