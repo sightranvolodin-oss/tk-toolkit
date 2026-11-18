@@ -89,7 +89,9 @@ class TK_CardSettings(bpy.types.PropertyGroup):
     bleed: BoolProperty(name="Растянуть цвет за край", default=True)
     bleed_px: FloatProperty(name="Пикселей", default=16, min=1, max=256)
     threshold: FloatProperty(name="Порог альфы", default=0.5, min=0.0, max=1.0)
-    binary_mask: BoolProperty(name="Жёсткая маска (0/1)", default=False)
+    binary_mask: BoolProperty(name="Жёсткая маска (0/1)", default=True,
+                              description="Opacity строго чёрно-белая. Для НПМ порог снижается до "
+                                          "0.25, чтобы тонкие стойки стали сплошным пикселем")
 
     atlas_name: StringProperty(name="Атлас", default="Cards",
                                description="Имя набора текстур; карточки с одним именем делят тайл")
@@ -382,7 +384,13 @@ def top_profile(pu, pz, u0, u1, cell=0.05, tol=0.03):
         return None                            # top and bottom don't rise together
     xs = np.concatenate([[u0], xs, [u1]])
     top = np.concatenate([[top[0]], top, [top[-1]]])
-    return _douglas_peucker(xs, top, tol)
+    prof = _douglas_peucker(xs, top, tol)
+    # a stair goes only up (or only down) along one railing; a saw-tooth top is a gate,
+    # a step in the fence or posts of different height — not a profile to follow
+    dz = np.diff(np.asarray(prof[1], float))
+    if (dz > 0.1).any() and (dz < -0.1).any():
+        return None
+    return prof
 
 
 def validate_period(pu, pz, length, height, period, cell=0.1):
@@ -933,11 +941,14 @@ def bake_segment(context, sources, plane, ch, tile, extrusion, max_dist, margin,
 def finish_maps(crop, s):
     """Flora-style post-processing on one area (dict ch -> array). Returns opacity max."""
     op = crop["OPACITY"][..., 0]
+    # НПМ: a thin bar is under a pixel and bakes half-transparent — a low threshold keeps
+    # it as a solid pixel instead of losing it
+    thr = min(s.threshold, 0.25) if s.model_type == "NPM" else s.threshold
     if s.bleed and "DIFFUSE" in crop:
         d = crop["DIFFUSE"]
-        d[..., :3] = M.bleed_colors(d[..., :3], op >= s.threshold, int(s.bleed_px))
+        d[..., :3] = M.bleed_colors(d[..., :3], op >= thr, int(s.bleed_px))
     if s.binary_mask:
-        op = (op >= s.threshold).astype(np.float32)
+        op = (op >= thr).astype(np.float32)
     crop["OPACITY"][..., 0] = crop["OPACITY"][..., 1] = crop["OPACITY"][..., 2] = op
     if "DIFFUSE" in crop:
         crop["DIFFUSE"][..., 3] = op
