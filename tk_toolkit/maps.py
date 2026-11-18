@@ -918,6 +918,72 @@ def pack_uv_islands(context, ob, uv_name, margin):
     return ok
 
 
+class TK_OT_maps_atlas_uv(bpy.types.Operator):
+    bl_idname = "tk.maps_atlas_uv"
+    bl_label = "Один атлас по текущей UV"
+    bl_description = ("Запечь все материалы активного меша (с текстурами и без) в один набор "
+                      "карт прямо по его текущей развёртке — острова не двигаются — и "
+                      "поставить один материал. Острова разных материалов не должны "
+                      "перекрываться")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and ob.type == "MESH" and len(ob.material_slots) > 0
+
+    def execute(self, context):
+        p = context.scene.tk_maps
+        out_dir = check_out_dir(self, p)
+        if out_dir is None:
+            return {"CANCELLED"}
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        src = context.active_object
+        if not src.data.uv_layers:
+            self.report({"ERROR"}, "У меша нет UV")
+            return {"CANCELLED"}
+        ob = _copy_object(context, src) if p.atlas_on_copy else src
+        for o in context.selected_objects:
+            o.select_set(False)
+        ob.hide_set(False)
+        ob.select_set(True)
+        context.view_layer.objects.active = ob
+        size = int(p.atlas_size)
+        chans = [c for c in p.channels() if CHANNELS[c][4] in ("EMIT", "NORMAL")]
+        base = bpy.path.clean_name(src.name) + "_atlas"
+        uv_name = ob.data.uv_layers.active.name
+        arrays = {}
+        wm = context.window_manager
+        wm.progress_begin(0, len(chans))
+        try:
+            for i, ch in enumerate(chans):
+                wm.progress_update(i)
+                img = new_image("TK_atlas_tmp", size, size, ch, alpha=False)
+                try:
+                    bake_channel(context, ob, ch, img, margin=max(2, int(p.atlas_padding)),
+                                 uv_layer=uv_name)
+                    arrays[ch] = image_array(img)
+                finally:
+                    bpy.data.images.remove(img)
+        finally:
+            wm.progress_end()
+        warnings = postprocess(arrays, p)
+        images = write_outputs(base, arrays, p, out_dir)
+        if p.atlas_replace:
+            mat = build_material(base, images, uv_name)
+            me = ob.data
+            me.materials.clear()
+            me.materials.append(mat)
+            import numpy as _np
+            me.polygons.foreach_set("material_index", _np.zeros(len(me.polygons), _np.int32))
+            me.update()
+        for w in warnings:
+            self.report({"WARNING"}, w)
+        self.report({"INFO"}, f"Атлас {size}×{size}: {', '.join(arrays)} → {out_dir}")
+        return {"FINISHED"}
+
+
 class TK_OT_maps_atlas(bpy.types.Operator):
     bl_idname = "tk.maps_atlas"
     bl_label = "Собрать атлас"
@@ -1126,6 +1192,7 @@ def draw_maps(layout, context):
     box.prop(p, "atlas_on_copy")
     box.prop(p, "atlas_replace")
     box.operator("tk.maps_atlas", icon="TEXTURE")
+    box.operator("tk.maps_atlas_uv", icon="UV")
 
 
 class TK_PT_maps(bpy.types.Panel):
@@ -1157,7 +1224,7 @@ class TK_PT_maps_node(bpy.types.Panel):
         draw_maps(self.layout, context)
 
 
-classes = (TK_MapsSettings, TK_OT_maps_extract, TK_OT_maps_atlas, TK_PT_maps, TK_PT_maps_node)
+classes = (TK_MapsSettings, TK_OT_maps_extract, TK_OT_maps_atlas, TK_OT_maps_atlas_uv, TK_PT_maps, TK_PT_maps_node)
 
 
 def register():

@@ -5,7 +5,7 @@ set -u
 PY="${PYTHON:-python}"
 cd "$(dirname "$0")"
 fail=0
-for t in t_ui t_cards t_railing t_batch t_repack t_facade_detect t_split t_maps t_atlas_check t_all t_bake t_layers t_modes t_retopo; do
+for t in t_ui t_cards t_railing t_batch t_repack t_atlas_uv t_facade_detect t_split t_maps t_atlas_check t_all t_bake t_layers t_modes t_retopo; do
   echo "=== $t"
   out=$(timeout 900 "$PY" run.py "$t.py" 2>&1 | grep -v "^Fra:")
   rc=${PIPESTATUS[0]}
