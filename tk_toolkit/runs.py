@@ -54,7 +54,8 @@ def mesh_loose_parts(me):
 # ---------------------------------------------------------------------------
 
 class Part:
-    __slots__ = ("idx", "center", "angle", "length", "zmin", "zmax", "pts", "line", "run")
+    __slots__ = ("idx", "center", "angle", "length", "zmin", "zmax", "pts", "line", "run",
+                 "mat")
 
 
 def describe_parts(W, lab, n):
@@ -75,6 +76,7 @@ def describe_parts(W, lab, n):
         p.length = 0.0
         p.line = -1
         p.run = -1
+        p.mat = 0
         if len(P) >= 3:
             q = xy - p.center
             w, v = np.linalg.eigh(q.T @ q)
@@ -102,6 +104,19 @@ def _group_sorted(values, gap):
 
 
 def find_lines(parts, angle_tol=3.0, offset_tol=0.15):
+    """Collinear long parts → lines. Parts of different materials never share a line:
+    a red stair railing and a white fence standing next to each other stay apart."""
+    lines = []
+    for mat in sorted({p.mat for p in parts}):
+        lines += _find_lines_one([p for p in parts if p.mat == mat], angle_tol, offset_tol)
+    for k, ln in enumerate(lines):
+        ln["mat"] = ln["parts"][0].mat
+        for m in ln["parts"]:
+            m.line = k
+    return lines
+
+
+def _find_lines_one(parts, angle_tol, offset_tol):
     el = [p for p in parts if p.angle is not None]
     if not el:
         return []
@@ -119,9 +134,6 @@ def find_lines(parts, angle_tol=3.0, offset_tol=0.15):
             us = np.concatenate([m.pts[:, :2] @ d for m in members])
             lines.append({"dir": d, "nrm": nrm, "offset": o,
                           "u0": float(us.min()), "u1": float(us.max()), "parts": members})
-    for k, ln in enumerate(lines):
-        for m in ln["parts"]:
-            m.line = k
     return lines
 
 
@@ -132,6 +144,8 @@ def attach_small(parts, lines, dist=0.15, margin=0.5):
             continue
         best, bd = -1, dist
         for k, ln in enumerate(lines):
+            if ln.get("mat", p.mat) != p.mat:
+                continue
             u = p.center @ ln["dir"]
             if u < ln["u0"] - margin or u > ln["u1"] + margin:
                 continue
@@ -228,7 +242,9 @@ def bar_rows(left, runs, step_max=0.35, min_bars=3):
     a, b = [], []
     for i in range(n):                                  # small n (leftovers only)
         d = np.linalg.norm(C[:, :2] - C[i, :2], axis=1)
-        m = (d < step_max) & (np.abs(C[:, 2] - C[i, 2]) < 0.3) & (np.arange(n) > i)
+        mats = np.array([q.mat for q in vert])
+        m = ((d < step_max) & (np.abs(C[:, 2] - C[i, 2]) < 0.3) & (np.arange(n) > i)
+             & (mats == vert[i].mat))
         js = np.nonzero(m)[0]
         a += [i] * len(js)
         b += js.tolist()
@@ -258,9 +274,29 @@ def bar_rows(left, runs, step_max=0.35, min_bars=3):
     return [p for p in left if id(p) not in used]
 
 
+def part_materials(me, lab, n):
+    """Dominant material index of every loose part."""
+    npo = len(me.polygons)
+    if npo == 0 or len(me.materials) <= 1:
+        return np.zeros(n, np.int64)
+    ls = np.empty(npo, np.int64)
+    me.polygons.foreach_get("loop_start", ls)
+    lv = np.empty(len(me.loops), np.int64)
+    me.loops.foreach_get("vertex_index", lv)
+    mi = np.empty(npo, np.int64)
+    me.polygons.foreach_get("material_index", mi)
+    plab = lab[lv[ls]]
+    nm = int(mi.max()) + 1
+    cnt = np.bincount(plab * nm + mi, minlength=n * nm).reshape(n, nm)
+    return cnt.argmax(1)
+
+
 def analyse_mesh(W, me):
     lab, n = mesh_loose_parts(me)
     parts = describe_parts(W, lab, n)
+    pm = part_materials(me, lab, n)
+    for p in parts:
+        p.mat = int(pm[p.idx])
     lines = find_lines(parts)
     left = attach_small(parts, lines)
     runs = split_runs(lines)
