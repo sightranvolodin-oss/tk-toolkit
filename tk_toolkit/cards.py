@@ -2015,6 +2015,39 @@ def card_with_texture(context, s, obj, tex, name, coll, info=None):
     return card, info
 
 
+def borrow_mask(pc, pmi, own, plab, part_line, r):
+    """Polygons of other lines' parts that lie in run *r*'s plane, at its local height."""
+    d2, n2 = np.asarray(r["dir"]), np.asarray(r["nrm"])
+    ownc = pc[own]
+    band = np.zeros(len(pc), bool)
+    if not len(ownc):
+        return band
+    off = float(np.median(ownc[:, :2] @ n2))
+    uu = pc[:, :2] @ d2
+    band = ((np.abs(pc[:, :2] @ n2 - off) < 0.06)
+            & (uu > r["u0"] - 0.05) & (uu < r["u1"] + 0.05)
+            & (pc[:, 2] > r["z0"] - 0.2) & (pc[:, 2] < r["z1"] + 0.3)
+            & np.isin(pmi, np.unique(pmi[own]))
+            & (part_line[plab] != r.get("line", -2)) & ~own)
+    cand = np.nonzero(band)[0]
+    if not len(cand):
+        return band
+    ou = ownc[:, :2] @ d2
+    b0 = float(r["u0"]) - 0.1
+    nb_ = int((float(r["u1"]) + 0.1 - b0) / 0.25) + 1
+    ob = np.clip(((ou - b0) / 0.25).astype(int), 0, nb_ - 1)
+    zlo = np.full(nb_, np.inf)
+    zhi = np.full(nb_, -np.inf)
+    np.minimum.at(zlo, ob, ownc[:, 2])
+    np.maximum.at(zhi, ob, ownc[:, 2])
+    cb = np.clip(((uu[cand] - b0) / 0.25).astype(int), 0, nb_ - 1)
+    lo_ = np.minimum(zlo[cb], zlo[np.clip(cb - 1, 0, nb_ - 1)])
+    hi_ = np.maximum(zhi[cb], zhi[np.clip(cb + 1, 0, nb_ - 1)])
+    ok = (pc[cand, 2] > lo_ - 0.1) & (pc[cand, 2] < hi_ + 0.15)
+    band[cand[~ok]] = False
+    return band
+
+
 def count_runs(context, min_length=1.0):
     """How many separate railing runs ≥ min_length the selected meshes hold."""
     from . import runs as RU
@@ -2088,12 +2121,23 @@ class TK_OT_card_batch(bpy.types.Operator):
             me.loops.foreach_get("vertex_index", lv)
             plab = lab[lv[ls_]]
             part_run = np.array([p.run for p in parts])
+            part_line = np.array([p.line for p in parts])
+            # a handrail bent around a corner is ONE part but belongs to two runs: each run
+            # also takes the polygons of other lines' parts lying in its own plane, at the
+            # height of its own geometry there
+            lt_ = np.empty(npoly, np.int64)
+            me.polygons.foreach_get("loop_total", lt_)
+            pc = np.add.reduceat(W[lv], ls_, axis=0) / lt_[:, None]
+            pmi = np.empty(npoly, np.int64)
+            me.polygons.foreach_get("material_index", pmi)
             keep = np.zeros(len(parts), bool)        # parts that stay geometry
             for i, r in enumerate(runs):
                 if r["u1"] - r["u0"] < min_len:
                     keep[[p.idx for p in r["parts"]]] = True
                     continue
-                sub = RU.submesh(me, part_run[plab] == i, f"{src.name}_run{i}", mcache)
+                own = part_run[plab] == i
+                band = borrow_mask(pc, pmi, own, plab, part_line, r)
+                sub = RU.submesh(me, own | band, f"{src.name}_run{i}", mcache)
                 o = bpy.data.objects.new(f"{src.name}_run{i}", sub)
                 o.matrix_world = src.matrix_world
                 context.scene.collection.objects.link(o)

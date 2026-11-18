@@ -243,7 +243,8 @@ def bar_rows(left, runs, step_max=0.35, min_bars=3):
     a, b = [], []
     for i in range(n):                                  # small n (leftovers only)
         d = np.linalg.norm(C[:, :2] - C[i, :2], axis=1)
-        m = (d < step_max) & (np.abs(C[:, 2] - C[i, 2]) < 0.3) & (np.arange(n) > i)
+        # bars of a sloped flight stand at different heights: allow the slope
+        m = (d < step_max) & (np.abs(C[:, 2] - C[i, 2]) < 0.3 + 1.0 * d) & (np.arange(n) > i)
         js = np.nonzero(m)[0]
         a += [i] * len(js)
         b += js.tolist()
@@ -290,6 +291,51 @@ def part_materials(me, lab, n):
     return cnt.argmax(1)
 
 
+def merge_tiny(runs, min_len=0.25, gap=0.35):
+    """A corner or end post often comes out as a 'run' of its own (4 cm long): give it to
+    the neighbouring run in the same plane instead of throwing it away."""
+    def off(r):
+        c = np.concatenate([p.pts[:, :2] for p in r["parts"]])
+        return float(np.median(c @ np.asarray(r["nrm"])))
+    big = [k for k, r in enumerate(runs) if r["parts"] and r["u1"] - r["u0"] >= min_len]
+    offs = {k: off(runs[k]) for k in big}
+    for t, r in enumerate(runs):
+        if not r["parts"] or r["u1"] - r["u0"] >= min_len:
+            continue
+        P = np.concatenate([p.pts for p in r["parts"]])
+        best, bd = -1, gap
+        for k in big:
+            q = runs[k]
+            d2, n2 = np.asarray(q["dir"]), np.asarray(q["nrm"])
+            if abs(float(np.mean(P[:, :2] @ n2)) - offs[k]) > 0.15:
+                continue
+            u = P[:, :2] @ d2
+            ug = max(0.0, q["u0"] - u.max(), u.min() - q["u1"])
+            if ug >= bd:
+                continue
+            # height of the neighbour right where the post stands (a sloped run's bounding
+            # box spans the floors above and below)
+            Q = np.concatenate([p.pts for p in q["parts"]])
+            qu = Q[:, :2] @ d2
+            near = np.abs(qu - float(np.median(u))) < 0.5
+            if not near.any():
+                continue
+            if P[:, 2].max() < Q[near, 2].min() - 0.1 or P[:, 2].min() > Q[near, 2].max() + 0.1:
+                continue
+            best, bd = k, ug
+        if best < 0:
+            continue
+        q = runs[best]
+        u = P[:, :2] @ np.asarray(q["dir"])
+        q["parts"] = q["parts"] + r["parts"]
+        q["u0"], q["u1"] = min(q["u0"], float(u.min())), max(q["u1"], float(u.max()))
+        q["z0"], q["z1"] = min(q["z0"], float(P[:, 2].min())), max(q["z1"], float(P[:, 2].max()))
+        for p in r["parts"]:
+            p.run = best
+        r["parts"] = []
+        r["u1"] = r["u0"]
+
+
 def analyse_mesh(W, me):
     lab, n = mesh_loose_parts(me)
     parts = describe_parts(W, lab, n)
@@ -300,6 +346,7 @@ def analyse_mesh(W, me):
     left = attach_small(parts, lines)
     runs = split_runs(lines)
     left = bar_rows(left, runs)
+    merge_tiny(runs)
     return lab, parts, lines, runs, left
 
 
