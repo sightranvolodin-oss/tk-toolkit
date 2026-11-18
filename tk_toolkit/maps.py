@@ -397,29 +397,40 @@ def set_image_array(img, arr):
 
 
 def bleed_colors(rgb, mask, iterations):
-    """Flora's edge padding: grow colour of opaque pixels into transparent ones."""
-    rgb = rgb.copy()
-    valid = mask.copy()
-    if not valid.any():
-        return rgb
-    shifts = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
-    for _ in range(iterations):
-        if valid.all():
-            break
-        acc = np.zeros_like(rgb)
-        cnt = np.zeros(valid.shape, np.float32)
-        vf = valid.astype(np.float32)
-        for dy, dx in shifts:
-            acc += np.roll(rgb * vf[..., None], (dy, dx), axis=(0, 1))
-            cnt += np.roll(vf, (dy, dx), axis=(0, 1))
-        grow = (~valid) & (cnt > 0)
-        if not grow.any():
-            break
-        rgb[grow] = acc[grow] / cnt[grow][:, None]
-        valid |= grow
-    if not valid.all():
-        rgb[~valid] = rgb[mask].mean(axis=0)
-    return rgb
+    """Edge padding: transparent pixels take the colour of the nearest opaque ones.
+    Push-pull on an image pyramid — the same look as growing ring by ring (Flora), but
+    in a fraction of a second even for 4096² (the ring loop took seconds and froze the UI).
+    *iterations* is kept for compatibility; every transparent pixel gets a colour."""
+    rgb = np.asarray(rgb, np.float32)
+    mask = np.asarray(mask, bool)
+    if not mask.any():
+        return rgb.copy()
+    if mask.all():
+        return rgb.copy()
+    # push: premultiplied colour and weight, halved until 1 px
+    cols = [rgb * mask[..., None]]
+    ws = [mask.astype(np.float32)]
+    while max(ws[-1].shape) > 1:
+        c, w = cols[-1], ws[-1]
+        h_, w_ = w.shape
+        if h_ % 2 or w_ % 2:
+            c = np.pad(c, ((0, h_ % 2), (0, w_ % 2), (0, 0)), mode="edge")
+            w = np.pad(w, ((0, h_ % 2), (0, w_ % 2)), mode="constant")
+        c2 = c[0::2, 0::2] + c[1::2, 0::2] + c[0::2, 1::2] + c[1::2, 1::2]
+        w2 = w[0::2, 0::2] + w[1::2, 0::2] + w[0::2, 1::2] + w[1::2, 1::2]
+        cols.append(c2)
+        ws.append(w2)
+    # pull: every level gets the colour of the coarser one where it has no data
+    col = cols[-1] / np.maximum(ws[-1], 1e-9)[..., None]
+    for c, w in zip(reversed(cols[:-1]), reversed(ws[:-1])):
+        h_, w_ = w.shape
+        up = np.repeat(np.repeat(col, 2, axis=0), 2, axis=1)[:h_, :w_]
+        own = c / np.maximum(w, 1e-9)[..., None]
+        a_ = np.clip(w, 0.0, 1.0)[..., None]
+        col = own * a_ + up * (1.0 - a_)
+    out = rgb.copy()
+    out[~mask] = col[~mask]
+    return out
 
 
 def postprocess(arrays, p):

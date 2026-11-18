@@ -455,6 +455,186 @@ def pack_layout(length, height, d, aw, ah):
     return pieces, tiles
 
 
+def pack_runs(items, d, aw, ah):
+    """Strips of several objects in ONE area at density *d* (shelf packing, tallest first).
+    *items*: [(key, length, height)]. Returns {key: [piece, …]} with pieces as in
+    pack_layout (tile index 0) or None if they don't fit."""
+    strips = []
+    for key, length, height in items:
+        band_px = min(ah, math.ceil(height * d))
+        if band_px < 1:
+            return None
+        band_m = band_px / d
+        chunk_m = (aw - GUTTER) / d
+        nz = max(1, math.ceil(height / band_m - 1e-9))
+        nu = max(1, math.ceil(length / chunk_m - 1e-9))
+        for iz in range(nz):
+            za, zb = iz * band_m, min(height, (iz + 1) * band_m)
+            for iu in range(nu):
+                ua, ub = iu * chunk_m, min(length, (iu + 1) * chunk_m)
+                w = max(1, math.ceil((ub - ua) * d))
+                h = max(1, math.ceil((zb - za) * d))
+                strips.append((key, ua, ub, za, zb, w, h))
+    strips.sort(key=lambda t: (-t[6], -t[5]))
+    out = {}
+    x = y = 0
+    shelf_h = 0
+    g = GUTTER
+    for key, ua, ub, za, zb, w, h in strips:
+        if x + w > aw:
+            x, y = 0, y + shelf_h + g
+            shelf_h = 0
+        if y + h > ah or w > aw:
+            return None
+        out.setdefault(key, []).append((ua, ub, za, zb, 0, x, y, w, h))
+        x += w + g
+        shelf_h = max(shelf_h, h)
+    return out
+
+
+def best_run_packing(items, aw, ah, dmin, dmax):
+    """Highest density in [dmin, dmax] at which all *items* fit one area."""
+    d = dmax
+    while d >= dmin - 1e-9:
+        r = pack_runs(items, d, aw, ah)
+        if r is not None:
+            return d, r
+        d *= 0.97
+    r = pack_runs(items, dmin, aw, ah)
+    return (dmin, r) if r is not None else (None, None)
+
+
+def piece_geometry(info, pieces, area, tile, d):
+    """Quads of one object's *pieces* on its bake plane. Returns (verts, faces, uv_final,
+    uv_area): final UVs in the atlas (half a pixel inside each rectangle) and UVs local to
+    the area, used for the (supersampled) bake."""
+    u, z, n = info["u"], info["z"], info["n"]
+    x0, y0, aw, ah = area
+    eps = max(1e-4, info["thickness"] * 0.02)
+    nc = info["n1"] + eps
+    verts, faces, uvf, uva = [], [], [], []
+    hp = 0.5 / tile
+    for (ua, ub, za, zb, _t, px, py, w, h) in pieces:
+        a_, b_ = info["u0"] + ua, info["u0"] + ub
+        c0, c1 = info["z0"] + za, info["z0"] + zb
+        j = len(verts)
+        for (uu, zz) in ((a_, c0), (b_, c0), (b_, c1), (a_, c1)):
+            q = frame_point(u, z, n, uu, zz, nc)
+            verts.append((q.x, q.y, q.z))
+        faces.append((j, j + 1, j + 2, j + 3))
+        wx, hy = (ub - ua) * d, (zb - za) * d               # exact, not whole pixels
+        U0, V0 = (x0 + px) / tile, (y0 + py) / tile
+        U1, V1 = (x0 + px + wx) / tile, (y0 + py + hy) / tile
+        uvf += [(U0 + hp, V0 + hp), (U1 - hp, V0 + hp), (U1 - hp, V1 - hp), (U0 + hp, V1 - hp)]
+        b0, c0_, b1, c1_ = px / aw, py / ah, (px + wx) / aw, (py + hy) / ah
+        uva += [(b0, c0_), (b1, c0_), (b1, c1_), (b0, c1_)]
+    return verts, faces, uvf, uva
+
+
+def joined_copy(context, items, name="TK_npm_sources"):
+    """One object holding world-space copies of all *items* [(obj, info|None)] — when info
+    has a profile the copy is straightened. Cycles' selected-to-active casts rays against
+    every selected object separately, so one joined object bakes many times faster."""
+    dg = context.evaluated_depsgraph_get()
+    cos, lvs, lss, lts, mis, uvs, smooth = [], [], [], [], [], [], []
+    mats = []
+    vo = lo = 0
+    for o, inf in items:
+        me = bpy.data.meshes.new_from_object(o.evaluated_get(dg), depsgraph=dg)
+        try:
+            me.transform(o.matrix_world)
+            nv, nl, npo = len(me.vertices), len(me.loops), len(me.polygons)
+            co = np.empty(nv * 3)
+            me.vertices.foreach_get("co", co)
+            co = co.reshape(-1, 3)
+            if inf is not None and inf.get("profile") is not None:
+                bu, bz = inf["profile"]
+                co -= np.interp(co @ np.array(inf["u"]), bu, bz)[:, None] * np.array(inf["z"])[None, :]
+            lv = np.empty(nl, np.int64); me.loops.foreach_get("vertex_index", lv)
+            ls = np.empty(npo, np.int64); me.polygons.foreach_get("loop_start", ls)
+            lt = np.empty(npo, np.int64); me.polygons.foreach_get("loop_total", lt)
+            mi = np.empty(npo, np.int64); me.polygons.foreach_get("material_index", mi)
+            sm = np.empty(npo, bool); me.polygons.foreach_get("use_smooth", sm)
+            remap = []
+            for m in (me.materials or [None]):
+                if m not in mats:
+                    mats.append(m)
+                remap.append(mats.index(m))
+            mi = np.array(remap)[np.clip(mi, 0, len(remap) - 1)]
+            uv = np.zeros((nl, 2), np.float32)
+            if me.uv_layers:
+                me.uv_layers[0].data.foreach_get("uv", uv.ravel())
+            cos.append(co); lvs.append(lv + vo); lss.append(ls + lo); lts.append(lt)
+            mis.append(mi); uvs.append(uv); smooth.append(sm)
+            vo += nv
+            lo += nl
+        finally:
+            bpy.data.meshes.remove(me)
+    me = bpy.data.meshes.new(name)
+    co = np.concatenate(cos); lv = np.concatenate(lvs); ls = np.concatenate(lss)
+    lt = np.concatenate(lts)
+    me.vertices.add(len(co)); me.vertices.foreach_set("co", co.astype(np.float32).ravel())
+    me.loops.add(len(lv)); me.loops.foreach_set("vertex_index", lv.astype(np.int32))
+    me.polygons.add(len(ls)); me.polygons.foreach_set("loop_start", ls.astype(np.int32))
+    try:
+        me.polygons.foreach_set("loop_total", lt.astype(np.int32))
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    me.polygons.foreach_set("material_index", np.concatenate(mis).astype(np.int32))
+    me.polygons.foreach_set("use_smooth", np.concatenate(smooth))
+    for m in mats:
+        me.materials.append(m)
+    me.uv_layers.new(name="UVMap").data.foreach_set("uv", np.concatenate(uvs).ravel())
+    me.update(calc_edges=True)
+    ob = bpy.data.objects.new(name, me)
+    context.scene.collection.objects.link(ob)
+    return ob
+
+
+def mesh_from(name, verts, faces, uvs):
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, [], faces)
+    uvl = me.uv_layers.new(name="UVMap")
+    uvl.data.foreach_set("uv", np.array(uvs, np.float32).ravel())
+    return me
+
+
+def bake_area(context, s, sources, target, area, d, thickness):
+    """Bake all channels of *sources* onto *target* whose UVs cover the area in [0, 1].
+    Supersampled at low density (a 2 cm bar at 10–40 px/m is under a pixel: averaging
+    several samples gives it partial alpha instead of hit-or-miss). Returns {ch: array}."""
+    _x0, _y0, aw, ah = area
+    ss = 1 if d >= 150 else (2 if d >= 25 else 3)
+    while ss > 1 and aw * ss > 3072:                  # one float image ≤ ~150 MB
+        ss -= 1
+    eps = max(1e-4, thickness * 0.02)
+    margin = max(4, int(s.bleed_px)) * ss
+
+    def down(a):
+        return a.reshape(ah, ss, aw, ss, a.shape[-1]).mean(axis=(1, 3))
+    chans = list(s.channels(sources))
+    chans.sort(key=lambda c: c != "OPACITY")       # alpha first: it weights the colours
+    out, w_ = {}, None
+    for ch in chans:
+        yield ch
+        a = bake_targets(context, sources, target, ch, aw * ss, eps, thickness + 3 * eps,
+                         margin, s.ao_samples)[0]
+        if ss == 1:
+            out[ch] = a
+        elif ch == "OPACITY":
+            w_ = a[..., :1].copy()
+            out[ch] = down(a)
+        elif w_ is None:
+            out[ch] = down(a)
+        else:                                       # colour of what is there, not the void
+            a *= w_
+            num = down(a)
+            den = down(w_)
+            out[ch] = np.where(den > 1e-6, num / np.maximum(den, 1e-6), num)
+        a = None
+    return out
+
+
 def best_packing(length, height, aw, ah, dmin, dmax, max_tiles):
     """Highest density ≤ dmax whose strip layout fits in *max_tiles* areas."""
     d = dmax
@@ -670,7 +850,8 @@ def _bake_image(ch, tile, name):
     return img
 
 
-def bake_targets(context, sources, target, ch, tile, extrusion, max_dist, margin, ao_samples):
+def bake_targets(context, sources, target, ch, tile, extrusion, max_dist, margin, ao_samples,
+                 aa=1):
     """Bake *ch* from *sources* onto *target* (selected-to-active). Every material slot of
     the target gets its own tile×tile image. Returns a list of arrays, one per slot."""
     tmats = [sl.material for sl in target.material_slots]
@@ -693,7 +874,7 @@ def bake_targets(context, sources, target, ch, tile, extrusion, max_dist, margin
     try:
         if kind == "EMIT":
             patches = [M._MatPatch(m, ch, None) for m in mats]
-        with M._SceneForBake(context, target, int(ao_samples) if kind == "AO" else 1,
+        with M._SceneForBake(context, target, int(ao_samples) if kind == "AO" else int(aa),
                              extra=sources):
             kw = dict(type=kind, use_selected_to_active=True, use_cage=False,
                       cage_extrusion=extrusion, max_ray_distance=max_dist,
@@ -718,9 +899,16 @@ def bake_targets(context, sources, target, ch, tile, extrusion, max_dist, margin
     return arrays
 
 
-def bake_segment(context, sources, plane, ch, tile, extrusion, max_dist, margin, ao_samples):
+def aa_samples(density):
+    """Low densities (НПМ): a 2 cm bar is under a pixel — several samples per pixel give
+    it partial alpha instead of a hit-or-miss line."""
+    return 16 if density < 150 else 1
+
+
+def bake_segment(context, sources, plane, ch, tile, extrusion, max_dist, margin, ao_samples,
+                 aa=1):
     return bake_targets(context, sources, plane, ch, tile, extrusion, max_dist, margin,
-                        ao_samples)[0]
+                        ao_samples, aa)[0]
 
 
 def finish_maps(crop, s):
@@ -772,6 +960,22 @@ def fit_local_period(pu, a, b, P0, rel=0.12, nfold=64):
     return float(P), float(a + (k + 0.5) / nfold * P), float(sc)
 
 
+def _sharpness_many(x, a, cands, nfold=64, block=48):
+    """_sharpness for many periods at once (vectorised in blocks)."""
+    sc = np.empty(len(cands))
+    ks = np.empty(len(cands), int)
+    xa = (x - a).astype(np.float64)
+    for i0 in range(0, len(cands), block):
+        P = np.asarray(cands[i0:i0 + block], np.float64)
+        f = np.mod(xa[None, :] / P[:, None], 1.0)
+        idx = np.minimum((f * nfold).astype(np.int64), nfold - 1)
+        idx += (np.arange(len(P)) * nfold)[:, None]
+        h = np.bincount(idx.ravel(), minlength=len(P) * nfold).reshape(len(P), nfold)
+        sc[i0:i0 + len(P)] = h.max(1) / np.maximum(h.mean(1), 1e-9)
+        ks[i0:i0 + len(P)] = h.argmax(1)
+    return sc, ks
+
+
 def _sharpness(x, a, P, nfold=64):
     h = np.bincount((((x - a) / P) % 1.0 * nfold).astype(int), minlength=nfold)
     return h.max() / max(h.mean(), 1e-9), int(np.argmax(h))
@@ -809,11 +1013,10 @@ def fit_bar_step(pu, a, b, step0, lo=0.55, hi=1.8, nfold=64):
     x = pu[m_]
     if len(x) < 300 or (b - a) < 2.5 * step0:
         return step0, None, 0.0
+    if len(x) > 40000:                       # plenty for a histogram; keeps the UI alive
+        x = x[np.random.default_rng(0).choice(len(x), 40000, replace=False)]
     cands = np.linspace(step0 * lo, step0 * hi, 500)
-    sc = np.empty(len(cands))
-    ks = np.empty(len(cands), int)
-    for i, P in enumerate(cands):
-        sc[i], ks[i] = _sharpness(x, a, P, nfold)
+    sc, ks = _sharpness_many(x, a, cands, nfold)
     good = np.nonzero(sc >= 0.8 * sc.max())[0]
     # among the good ones take the largest step, refined to its local maximum
     j = good[-1]
@@ -928,9 +1131,14 @@ def detect_bars(info, step0):
         return np.zeros(0)
     # one peak per bar: strongest first, nothing else within 60 % of a step
     rad = 0.6 * step0 / cell
+    # posts on both sides of a gap are separate bars: suppress only within one piece
+    gl = find_gaps(info)
+    cuts = [g[0] for g in gl]
+    def piece(q):
+        return int(np.searchsorted(cuts, e[q]))
     taken = []
     for q in pk[np.argsort(-h[pk], kind="stable")]:
-        if all(abs(q - t) >= rad for t in taken):
+        if all(abs(q - t) >= rad or piece(q) != piece(t) for t in taken):
             taken.append(q)
     taken.sort()
     c = (e[:-1] + e[1:]) / 2
@@ -939,8 +1147,11 @@ def detect_bars(info, step0):
     raw = np.histogram(x, bins=nb, range=(info["u0"], info["u1"]))[0].astype(float)
     out = []
     for q in taken:
+        k_ = piece(q)                       # the window must not reach across a gap
+        plo = 0 if k_ == 0 else int(np.searchsorted(e, gl[k_ - 1][1]))
+        phi = nb if k_ >= len(gl) else int(np.searchsorted(e, gl[k_][0]))
         for _ in range(2):
-            lo, hi = max(0, q - r), min(nb, q + r + 1)
+            lo, hi = max(plo, q - r), min(phi, q + r + 1)
             wsum = raw[lo:hi].sum()
             if wsum <= 0:
                 break
@@ -949,7 +1160,7 @@ def detect_bars(info, step0):
     return np.array(out)
 
 
-def bar_grid(peaks, step0):
+def bar_grid(peaks, step0, keep_last=False):
     """Turn detected peaks into a bar sequence with integer indices: off-grid peaks (posts at
     breaks, brackets) are dropped, missing bars are bridged. The local step may drift slowly
     (sections of one railing differ by a few per cent)."""
@@ -957,6 +1168,7 @@ def bar_grid(peaks, step0):
         return np.zeros(0), np.zeros(0, int)
     xs, ix = [float(peaks[0])], [0]
     st = step0
+    peaks = list(peaks)
     for x in peaks[1:]:
         g = x - xs[-1]
         n = g / st
@@ -968,8 +1180,9 @@ def bar_grid(peaks, step0):
                     xs[-1] = float(x)
             continue
         kk = int(round(n))
-        if abs(n - kk) > 0.3:
-            continue                                   # off-grid
+        if abs(n - kk) > 0.3 and not (keep_last and x is peaks[-1]):
+            continue                                   # off-grid (a post at a gap still counts)
+        kk = max(1, kk)
         xs.append(float(x))
         ix.append(ix[-1] + kk)
         if kk == 1:
@@ -988,7 +1201,24 @@ def bar_card_uvs(card, info, m, k, off=0.5):
     gap = float(np.median(np.diff(peaks)))
     if not 0.8 * P / m < gap < 1.25 * P / m:
         return False                                   # peaks are not the bars of this step
-    bars, idx = bar_grid(peaks, P / m)
+    gaps = find_gaps(info)
+    if gaps:
+        # grid per piece; the index jumps over the gap
+        cuts = [g[0] for g in gaps]
+        pid = np.searchsorted(cuts, peaks)
+        bl, il = [], []
+        for q in np.unique(pid):
+            b_, i_ = bar_grid(peaks[pid == q], P / m, keep_last=True)
+            if len(b_) == 0:
+                b_, i_ = peaks[pid == q][:1], np.zeros(1, int)
+            if bl:
+                jump = max(1, int(round((b_[0] - bl[-1][-1]) / (P / m))))
+                i_ = i_ + il[-1][-1] + jump
+            bl.append(b_)
+            il.append(i_)
+        bars, idx = np.concatenate(bl), np.concatenate(il)
+    else:
+        bars, idx = bar_grid(peaks, P / m)
     if len(bars) < 3 or len(bars) < 0.7 * len(peaks):
         return False
     # a perfectly regular railing needs no cuts: the card's own UVs already fit
@@ -1034,11 +1264,20 @@ def bar_card_uvs(card, info, m, k, off=0.5):
     me = card.data
     bm = bmesh.new()
     bm.from_mesh(me)
-    for x in bars:
+    gaps_ = find_gaps(info)
+    for x in list(bars) + [g for ab in gaps_ for g in ab]:
         geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
         bmesh.ops.bisect_plane(bm, geom=geom, plane_co=U * float(x), plane_no=U)
     uvl = bm.loops.layers.uv.active
     jj = idx.astype(float) + c
+
+    def local_step(j):
+        """metres per bar step around bar j, from its neighbour on the same side."""
+        if 0 < j and idx[j] != idx[j - 1] and not any(bars[j - 1] < a_ < bars[j] for a_, _ in gaps_):
+            return (bars[j] - bars[j - 1]) / (idx[j] - idx[j - 1])
+        if j + 1 < len(bars) and not any(bars[j] < a_ < bars[j + 1] for a_, _ in gaps_):
+            return (bars[j + 1] - bars[j]) / (idx[j + 1] - idx[j])
+        return P / m
 
     def t_at(u, j):
         """u inside bar interval j (−1 = before the first bar, len−1 = after the last)."""
@@ -1048,6 +1287,13 @@ def bar_card_uvs(card, info, m, k, off=0.5):
         if j >= len(bars) - 1:
             g = (bars[-1] - bars[-2]) / (idx[-1] - idx[-2])
             return tex_t(jj[-1]) + (u - bars[-1]) / g / m
+        gap = next(((a_, b_) for a_, b_ in gaps_ if bars[j] < a_ < bars[j + 1]), None)
+        if gap is not None:
+            # the interval spans a gap: each side continues its own bar at its own step
+            # (interpolating across the gap would squeeze the end posts)
+            if u <= 0.5 * (gap[0] + gap[1]):
+                return tex_t(jj[j]) + (u - bars[j]) / local_step(j) / m
+            return tex_t(jj[j + 1]) - (bars[j + 1] - u) / local_step(j + 1) / m
         f = (u - bars[j]) / (bars[j + 1] - bars[j])
         return tex_t(jj[j] + f * (jj[j + 1] - jj[j]))
 
@@ -1102,6 +1348,61 @@ def fit_card_uvs(card, info):
     bm.to_mesh(me)
     bm.free()
     me.update()
+
+
+def find_gaps(info, min_gap=0.08, cell=0.02):
+    """u-intervals with no geometry at all (two railings end to end with a gap between)."""
+    pu, pz = info["samples"]
+    u0, u1 = info["u0"], info["u1"]
+    # look at the upper part of the band only: base plates and brackets at the floor are
+    # often wider than the posts and close the gap between two railings down there
+    H = info["z1"] - info["z0"]
+    pu = pu[pz > info["z0"] + 0.45 * H]
+    nb = max(1, int(math.ceil((u1 - u0) / cell)))
+    if len(pu) < 8 * nb:                           # too sparse to tell empty from unsampled
+        return []
+    h, e = np.histogram(pu, bins=nb, range=(u0, u1))
+    empty = h == 0
+    out, j = [], 0
+    while j < nb:
+        if empty[j]:
+            k = j
+            while k < nb and empty[k]:
+                k += 1
+            # a real gap: the rails run right up to it on both sides (between the bars
+            # of a part without a handrail up there it is also empty — that's no gap)
+            w = max(3, int(round(0.3 / cell)))
+            left, right = ~empty[max(0, j - w):j], ~empty[k:k + w]
+            if ((k - j) * cell >= min_gap and j > 0 and k < nb and len(left) >= 3
+                    and len(right) >= 3 and left.mean() >= 0.9 and right.mean() >= 0.9):
+                out.append((float(e[j]), float(e[k])))
+            j = k
+        else:
+            j += 1
+    return out
+
+
+def cut_gaps(card, info):
+    """Remove the card where the railing has a gap, so the texture doesn't bridge it."""
+    import bmesh
+    gaps = find_gaps(info)
+    if not gaps:
+        return 0
+    U = Vector(info["u"])
+    me = card.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    for a, b in gaps:
+        for x in (a, b):
+            geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+            bmesh.ops.bisect_plane(bm, geom=geom, plane_co=U * x, plane_no=U)
+    dead = [f for f in bm.faces
+            if any(a < f.calc_center_median().dot(U) < b for a, b in gaps)]
+    bmesh.ops.delete(bm, geom=dead, context="FACES")
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+    return len(gaps)
 
 
 def warp_to_profile(card, info):
@@ -1194,6 +1495,14 @@ def analyse(context, s):
     tile = int(s.tile_size)
     info["plan"] = plan(info["length"], info["height"], period, tile, s.model_type,
                         s.density_min, s.density_max, s.quadrant, s.max_tiles)
+    if s.model_type == "NPM" and info["plan"]["tiled"]:
+        # the quarter is ours to use as we like: bake the object whole (no repeat) when it
+        # fits at the minimal density — every bar lands exactly where it is
+        pu_ = plan(info["length"], info["height"], None, tile, s.model_type,
+                   s.density_min, s.density_max, s.quadrant, 1)
+        if pu_["tiles"] == 1 and pu_["density"] >= s.density_min - 1e-6:
+            pu_["unique"] = True
+            info["plan"] = pu_
     return info
 
 
@@ -1251,10 +1560,33 @@ class TK_OT_card_make(bpy.types.Operator):
                       "пролёту и заменить геометрию этой плоскостью")
     bl_options = {"REGISTER", "UNDO"}
 
+    def invoke(self, context, event):
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        n_runs = count_runs(context)
+        if n_runs >= 2:
+            self.report({"INFO"}, f"В выделении {n_runs} отдельных веток перил — делаю пакетно")
+            return bpy.ops.tk.card_batch("INVOKE_DEFAULT")
+        context.window.cursor_set("WAIT")
+        try:
+            self._checked = True
+            return self.execute(context)
+        finally:
+            context.window.cursor_set("DEFAULT")
+
     def execute(self, context):
         s = context.scene.tk_card
         if context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
+        n_runs = 0 if getattr(self, "_checked", False) else count_runs(context)
+        if n_runs >= 2:
+            # several separate railings (floors, sides, flights) in the selection: one card
+            # through all of them is nonsense — do each one, sharing textures
+            r = bpy.ops.tk.card_batch("EXEC_DEFAULT")
+            if r == {"FINISHED"}:
+                self.report({"INFO"}, f"В выделении {n_runs} отдельных веток перил — "
+                                      "сделано пакетно, по карточке на ветку")
+            return r
         try:
             info = analyse(context, s)
         except RuntimeError as ex:
@@ -1286,6 +1618,9 @@ class TK_OT_card_make(bpy.types.Operator):
         p_ = info["plan"]
         if s.fit_sections and p_["tiled"] and p_["wrap"] and "bar_offset" in info:
             fit_card_uvs(card, info)
+        ng = cut_gaps(card, info)
+        if ng:
+            lines.append(f"Разрывов в перилах: {ng} — карточка там вырезана")
         card["tk_card_density"] = info["plan"]["density"]
         _last_texture["tex"] = info.get("texture") if info["plan"]["tiled"] else None
         return self._finish(context, s, originals, card, lines, warns)
@@ -1347,7 +1682,7 @@ class TK_OT_card_make(bpy.types.Operator):
             margin = max(4, int(s.bleed_px))
             for ch in s.channels(objs):
                 arrays[ch] = bake_segment(context, objs, plane, ch, tile, extrusion, max_dist,
-                                          margin, s.ao_samples)
+                                          margin, s.ao_samples, aa_samples(p["density"]))
         finally:
             me = plane.data
             bpy.data.objects.remove(plane)
@@ -1452,7 +1787,8 @@ class TK_OT_card_make(bpy.types.Operator):
             margin = max(4, int(s.bleed_px))
             for ch in s.channels(objs):
                 arrs = bake_targets(context, objs, card, ch, tile, eps,
-                                    info["thickness"] + 3 * eps, margin, s.ao_samples)
+                                    info["thickness"] + 3 * eps, margin, s.ao_samples,
+                                    aa_samples(p["density"]))
                 for t, a in enumerate(arrs):
                     per_tile[t][ch] = a[sl].copy()
         except Exception:
@@ -1654,7 +1990,29 @@ def card_with_texture(context, s, obj, tex, name, coll, info=None):
         return None, "шаг стоек не совпадает с текстурой"
     info["period"] = tex["P"]
     fit_card_uvs(card, info)
+    cut_gaps(card, info)
     return card, info
+
+
+def count_runs(context, min_length=1.0):
+    """How many separate railing runs ≥ min_length the selected meshes hold."""
+    from . import runs as RU
+    n = 0
+    for src in [o for o in context.selected_objects if o.type == "MESH"]:
+        me = src.data
+        nv = len(me.vertices)
+        if nv == 0:
+            continue
+        co = np.empty(nv * 3)
+        me.vertices.foreach_get("co", co)
+        mw = np.array([list(r) for r in src.matrix_world])
+        W = co.reshape(-1, 3) @ mw[:3, :3].T + mw[:3, 3]
+        try:
+            _lab, _parts, _lines, runs, _left = RU.analyse_mesh(W, me)
+        except Exception:
+            continue
+        n += sum(1 for r in runs if r["u1"] - r["u0"] >= min_length)
+    return n
 
 
 class TK_OT_card_batch(bpy.types.Operator):
@@ -1670,20 +2028,27 @@ class TK_OT_card_batch(bpy.types.Operator):
     max_types: bpy.props.IntProperty(name="Максимум типов перил (текстур)", default=6, min=1,
                                      max=16)
 
-    def execute(self, context):
+    # The work is a generator: execute() runs it to the end, invoke() runs it from a timer
+    # one step at a time, so Blender keeps redrawing, shows progress and Esc cancels.
+    def _steps(self, context):
         from . import runs as RU
         s = context.scene.tk_card
+        self._result = {"CANCELLED"}
+        self._temp, self._made, self._srcs = [], [], []
         if context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
         srcs = [o for o in context.selected_objects if o.type == "MESH"]
         if not srcs:
             self.report({"WARNING"}, "Выделите меш с перилами")
-            return {"CANCELLED"}
+            return
         wm = context.window_manager
         coll = srcs[0].users_collection[0] if srcs[0].users_collection else context.scene.collection
         run_objs, leftovers = [], []
-        for src in srcs:
+        self._srcs = list(srcs)
+        for si, src in enumerate(srcs):
+            yield 0.02, f"Разбор меша {src.name} на ветки…"
             me = src.data
+            mcache = RU.mesh_cache(me)
             nv = len(me.vertices)
             co = np.empty(nv * 3)
             me.vertices.foreach_get("co", co)
@@ -1702,17 +2067,18 @@ class TK_OT_card_batch(bpy.types.Operator):
                 if r["u1"] - r["u0"] < self.min_length:
                     keep[[p.idx for p in r["parts"]]] = True
                     continue
-                sub = RU.submesh(me, part_run[plab] == i, f"{src.name}_run{i}")
+                sub = RU.submesh(me, part_run[plab] == i, f"{src.name}_run{i}", mcache)
                 o = bpy.data.objects.new(f"{src.name}_run{i}", sub)
                 o.matrix_world = src.matrix_world
                 context.scene.collection.objects.link(o)
                 run_objs.append((o, r, src, i))
+                self._temp.append(o)
             for p in left:
                 keep[p.idx] = True
-            leftovers.append((src, keep[plab] if len(keep) else None, part_run, plab))
+            leftovers.append((src, keep[plab] if len(keep) else None, part_run, plab, mcache))
         if not run_objs:
             self.report({"WARNING"}, "Не нашлось веток длиннее порога")
-            return {"CANCELLED"}
+            return
 
         def select_only(o):
             C.deselect_all(context.view_layer)
@@ -1728,7 +2094,8 @@ class TK_OT_card_batch(bpy.types.Operator):
         quick = {}
         s.period_mode = "NONE"
         try:
-            for o, *_ in run_objs:
+            for j, (o, *_r) in enumerate(run_objs):
+                yield 0.05 + 0.15 * j / len(run_objs), f"Обмер веток {j + 1}/{len(run_objs)}"
                 select_only(o)
                 inf = analyse(context, s)
                 o.hide_set(True)
@@ -1738,60 +2105,70 @@ class TK_OT_card_batch(bpy.types.Operator):
         finally:
             s.period_mode = prev[1]
 
-        # group runs into railing types; the longest run of a type is its master
-        groups = []                     # dicts: master, tex, members
-        cards, failed = [], []
-        wm.progress_begin(0, len(run_objs))
-        s.originals = "KEEP"
-        s.period_mode = "AUTO"
-        try:
-            for j, (o, r, src, i) in enumerate(run_objs):
-                wm.progress_update(j)
-                H, inf, plausible = quick[o.name]
-                home, best = None, 0.0
-                for g in groups:
-                    gH = g["H"]
-                    if abs(H - gH) > 0.03 * gH:
+        groups = []
+        if s.model_type == "NPM":
+            cards, failed = yield from self._npm_steps(context, s, run_objs, quick, coll,
+                                                       prev, groups)
+        else:
+            # group runs into railing types; the longest run of a type is its master
+            groups = []                     # dicts: master, tex, members
+            cards, failed = [], []
+            s.originals = "KEEP"
+            s.period_mode = "AUTO"
+            try:
+                for j, (o, r, src, i) in enumerate(run_objs):
+                    frac = 0.2 + 0.75 * j / len(run_objs)
+                    yield frac, f"Карточки: ветка {j + 1}/{len(run_objs)}, типов {len(groups)}"
+                    H, inf, plausible = quick[o.name]
+                    home, best = None, 0.0
+                    for g in groups:
+                        gH = g["H"]
+                        if abs(H - gH) > 0.03 * gH:
+                            continue
+                        mt = profile_match(z_profile(inf, inf["z1"], gH), g["tex"]["zprof"])
+                        if mt >= 0.7 and mt > best:
+                            home, best = g, mt
+                    if home is not None:
+                        select_only(o)
+                        card, why = card_with_texture(context, s, o, home["tex"],
+                                                      f"{src.name}_card{i}", coll, info=inf)
+                        o.hide_set(True)
+                        if card is not None:
+                            cards.append(card)
+                            self._made.append(card)
+                            home["n"] += 1
+                            continue
+                        failed.append((o.name, why))
                         continue
-                    mt = profile_match(z_profile(inf, inf["z1"], gH), g["tex"]["zprof"])
-                    if mt >= 0.7 and mt > best:
-                        home, best = g, mt
-                if home is not None:
+                    if not plausible or len(groups) >= self.max_types:
+                        failed.append((o.name, "высота больше 2,5 м — профиль не распознан" if not plausible
+                                       else "слишком много типов перил"))
+                        continue
+                    # a new railing type: bake it
+                    gname = s.atlas_name if not groups else f"{prev[2]}_{len(groups) + 1}"
+                    yield frac, (f"Запекание текстуры типа {len(groups) + 1} "
+                                 f"(ветка {j + 1}/{len(run_objs)}, {r['u1'] - r['u0']:.1f} м)…")
+                    s.atlas_name = gname
                     select_only(o)
-                    card, why = card_with_texture(context, s, o, home["tex"],
-                                                  f"{src.name}_card{i}", coll, info=inf)
+                    res = bpy.ops.tk.card_make()
+                    mc = context.view_layer.objects.active
                     o.hide_set(True)
-                    if card is not None:
-                        cards.append(card)
-                        home["n"] += 1
+                    tex = _last_texture.get("tex")
+                    if "FINISHED" not in res or mc is o or tex is None:
+                        if "FINISHED" in res and mc is not o and mc is not None:
+                            bpy.data.objects.remove(mc)
+                        failed.append((o.name, "не тайлится (нет повторяющихся стоек)"))
                         continue
-                    failed.append((o.name, why))
-                    continue
-                if not plausible or len(groups) >= self.max_types:
-                    failed.append((o.name, "высота больше 2,5 м — профиль не распознан" if not plausible
-                                   else "слишком много типов перил"))
-                    continue
-                # a new railing type: bake it
-                gname = s.atlas_name if not groups else f"{prev[2]}_{len(groups) + 1}"
-                s.atlas_name = gname
-                select_only(o)
-                res = bpy.ops.tk.card_make()
-                mc = context.view_layer.objects.active
-                o.hide_set(True)
-                tex = _last_texture.get("tex")
-                if "FINISHED" not in res or mc is o or tex is None:
-                    if "FINISHED" in res and mc is not o and mc is not None:
-                        bpy.data.objects.remove(mc)
-                    failed.append((o.name, "не тайлится (нет повторяющихся стоек)"))
-                    continue
-                cards.append(mc)
-                groups.append({"H": tex["H"], "tex": tex, "n": 1, "atlas": gname})
-        finally:
-            s.originals, s.period_mode, s.atlas_name = prev
-        wm.progress_end()
+                    cards.append(mc)
+                    self._made.append(mc)
+                    groups.append({"H": tex["H"], "tex": tex, "n": 1, "atlas": gname})
+            finally:
+                s.originals, s.period_mode, s.atlas_name = prev
+        yield 0.96, "Сборка результата…"
         if not cards:
+            self.cleanup()
             self.report({"ERROR"}, "Ни одна ветка не превратилась в карточку")
-            return {"CANCELLED"}
+            return
 
         # leftovers: parts not converted (short runs, unassigned, failed runs) stay as geometry
         failed_ids = {}
@@ -1799,23 +2176,19 @@ class TK_OT_card_batch(bpy.types.Operator):
             src_name = oname.split("_run")[0]
             failed_ids.setdefault(src_name, []).append(int(oname.rsplit("_run", 1)[1]))
         rest_objs = []
-        for src, keepmask, part_run, plab in leftovers:
+        for src, keepmask, part_run, plab, mcache in leftovers:
             mask = keepmask.copy() if keepmask is not None else np.zeros(len(src.data.polygons), bool)
             for ri in failed_ids.get(src.name, []):
                 mask |= part_run[plab] == ri
             if mask.any():
-                me2 = RU.submesh(src.data, mask, f"{src.name}_остаток")
+                me2 = RU.submesh(src.data, mask, f"{src.name}_остаток", mcache)
                 ro = bpy.data.objects.new(f"{src.name}_остаток", me2)
                 ro.matrix_world = src.matrix_world
                 coll.objects.link(ro)
                 rest_objs.append(ro)
             src.hide_set(True)
             src.hide_render = True
-        for o, *_ in run_objs:
-            me_ = o.data
-            bpy.data.objects.remove(o)
-            if me_.users == 0:
-                bpy.data.meshes.remove(me_)
+        self._remove_temp()
 
         for c in cards:
             if c.name not in coll.objects:
@@ -1849,7 +2222,214 @@ class TK_OT_card_batch(bpy.types.Operator):
         if failed:
             msg += f"; не подошли {len(failed)} (оставлены геометрией)"
         self.report({"INFO"}, msg)
-        return {"FINISHED"}
+        self._result = {"FINISHED"}
+
+
+    def _npm_steps(self, context, s, run_objs, quick, coll, prev, groups):
+        """НПМ: no repeats — every run is baked whole, and the strips of ALL runs are
+        packed into the chosen quarter of one texture (UVs never leave it)."""
+        tile = int(s.tile_size)
+        area = area_rect(tile, "NPM", s.quadrant)
+        x0, y0, aw, ah = area
+        cards, failed = [], []
+        items = []
+        for o, r, src, i in run_objs:
+            H, inf, plausible = quick[o.name]
+            if not plausible:
+                failed.append((o.name, "высота больше 2,5 м — профиль не распознан"))
+                continue
+            items.append((o.name, inf["length"], inf["height"]))
+        # all at the best common density; if even the minimum doesn't fit, the shortest
+        # runs stay geometry until the rest fits
+        d, placed = best_run_packing(items, aw, ah, s.density_min, s.density_max)
+        dropped = []
+        while d is None and items:
+            items.sort(key=lambda t: t[1] * t[2])
+            dropped.append(items.pop(0))
+            d, placed = best_run_packing(items, aw, ah, s.density_min, s.density_max)
+        for key, *_ in dropped:
+            failed.append((key, f"не влезло в четверть при {s.density_min:g} px/м"))
+        if not items:
+            return cards, failed
+        groups.append({"atlas": s.atlas_name, "n": 0, "H": max(t[2] for t in items)})
+        by_name = {o.name: (o, r, src, i) for o, r, src, i in run_objs}
+        # 1) every run: its card (final) and its quads on one common bake target
+        tv, tf, tuv = [], [], []
+        sources, temps, thick = [], [], 0.0
+        acc = None
+        try:
+            for j, (key, _L, _H) in enumerate(items):
+                o, r, src, i = by_name[key]
+                if j % 4 == 0:
+                    yield (0.2 + 0.2 * j / len(items),
+                           f"НПМ {d:.1f} px/м: раскладка веток в четверть {j + 1}/{len(items)}")
+                _H, inf, _p = quick[key]
+                verts, faces, uvf, uva = piece_geometry(inf, placed[key], area, tile, d)
+                k0 = len(tv)
+                tv += verts
+                tf += [tuple(k0 + q for q in f) for f in faces]
+                tuv += uva
+                eps = max(1e-4, inf["thickness"] * 0.02)
+                shift = np.array(inf["n"]) * (inf.get("n_card", (inf["n0"] + inf["n1"]) / 2)
+                                              - (inf["n1"] + eps))
+                me = mesh_from(f"{src.name}_card{i}", [tuple(np.array(v) + shift) for v in verts],
+                               faces, uvf)
+                card = bpy.data.objects.new(me.name, me)
+                coll.objects.link(card)
+                if inf["profile"] is not None:
+                    warp_to_profile(card, inf)
+                sources.append((o, inf))
+                thick = max(thick, inf["thickness"])
+                cards.append(card)
+                self._made.append(card)
+                card["tk_card_density"] = d
+                groups[0]["n"] += 1
+            # 2) one bake for all runs (per channel), instead of one per run
+            tme = mesh_from("TK_npm_bake", tv, tf, tuv)
+            tmat = bpy.data.materials.new("TK_card_bake")
+            try:
+                tmat.use_nodes = True
+            except Exception:
+                pass
+            tme.materials.append(tmat)
+            target = bpy.data.objects.new("TK_npm_bake", tme)
+            coll.objects.link(target)
+            yield 0.42, f"НПМ: сборка {len(sources)} веток в один объект для запекания…"
+            joined = joined_copy(context, sources)
+            temps.append(joined)
+            sources = [joined]
+            try:
+                gen = bake_area(context, s, sources, target, area, d, thick)
+                while True:
+                    try:
+                        ch = next(gen)
+                    except StopIteration as st:
+                        acc = st.value
+                        break
+                    yield 0.45, f"НПМ: запекание «{ch}» сразу для {len(items)} веток…"
+            finally:
+                bpy.data.objects.remove(target)
+                bpy.data.meshes.remove(tme)
+                bpy.data.materials.remove(tmat)
+        finally:
+            for t in temps:
+                me_ = t.data
+                bpy.data.objects.remove(t)
+                if me_.users == 0:
+                    bpy.data.meshes.remove(me_)
+        if not acc:
+            return cards, failed
+        yield 0.92, "НПМ: доводка карт и запись атласа…"
+        finish_maps(acc, s)
+        sl = (slice(y0, y0 + ah), slice(x0, x0 + aw))
+        images = write_atlas(s.atlas_name, acc, tile, sl)
+        mat = card_material(s.atlas_name, images)
+        for c in cards:
+            c.data.materials.clear()
+            c.data.materials.append(mat)
+            c["tk_card_density"] = d
+        self._npm_density = d
+        return cards, failed
+
+    def _remove_temp(self):
+        for o in self._temp:
+            try:
+                me_ = o.data
+                bpy.data.objects.remove(o)
+                if me_.users == 0:
+                    bpy.data.meshes.remove(me_)
+            except ReferenceError:
+                pass
+        self._temp = []
+
+    def cleanup(self):
+        """Undo what a cancelled / failed run left behind."""
+        self._remove_temp()
+        for c in self._made:
+            try:
+                me_ = c.data
+                bpy.data.objects.remove(c)
+                if me_ is not None and me_.users == 0:
+                    bpy.data.meshes.remove(me_)
+            except ReferenceError:
+                pass
+        self._made = []
+        for src in self._srcs:
+            try:
+                src.hide_set(False)
+                src.select_set(True)
+            except (ReferenceError, RuntimeError):
+                pass
+
+    def execute(self, context):
+        try:
+            for _ in self._steps(context):
+                pass
+        except Exception:
+            self.cleanup()
+            raise
+        return self._result
+
+    def invoke(self, context, event):
+        self._gen = self._steps(context)
+        self._busy = False
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        wm.progress_begin(0, 1000)
+        self._status(context, "Перила целиком: начинаю…")
+        return {"RUNNING_MODAL"}
+
+    def _status(self, context, text):
+        try:
+            context.workspace.status_text_set(text + "   ·   Esc — отменить")
+        except Exception:
+            pass
+        if context.area:
+            context.area.header_text_set(text)
+        C.tag_redraw_3d()
+
+    def _end(self, context):
+        wm = context.window_manager
+        if self._timer is not None:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        wm.progress_end()
+        try:
+            context.workspace.status_text_set(None)
+        except Exception:
+            pass
+        if context.area:
+            context.area.header_text_set(None)
+
+    def modal(self, context, event):
+        if event.type == "ESC":
+            self._end(context)
+            s_ = context.scene.tk_card
+            self._gen.close()                  # runs the generator's finally blocks
+            self.cleanup()
+            self.report({"WARNING"}, "Отменено — сцена возвращена как была")
+            return {"CANCELLED"}
+        if event.type != "TIMER" or self._busy:
+            return {"PASS_THROUGH"}
+        self._busy = True
+        try:
+            frac, text = next(self._gen)
+        except StopIteration:
+            self._end(context)
+            return self._result
+        except Exception as ex:
+            self._end(context)
+            self.cleanup()
+            self.report({"ERROR"}, f"Ошибка: {ex}")
+            import traceback
+            traceback.print_exc()
+            return {"CANCELLED"}
+        finally:
+            self._busy = False
+        context.window_manager.progress_update(int(frac * 1000))
+        self._status(context, f"Перила целиком: {int(frac * 100)}% · {text}")
+        return {"RUNNING_MODAL"}
 
 
 _last_texture = {}

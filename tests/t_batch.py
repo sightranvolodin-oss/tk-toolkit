@@ -55,3 +55,23 @@ assert any(n.bl_idname == "ShaderNodeTexImage" and n.image for n in img)
 xs = [v.co.x for v in cards[0].data.vertices]
 print("card x range", min(xs), max(xs))
 assert min(xs) > -0.2 and max(xs) < 6.2
+
+# ---- НПМ: no repeats, every run baked whole, all UVs inside the chosen quarter
+for o in list(bpy.data.objects):
+    if o is not ob: bpy.data.objects.remove(o)
+ob.hide_set(False); ob.hide_render = False
+for x in bpy.data.objects: x.select_set(False)
+ob.select_set(True); bpy.context.view_layer.objects.active = ob
+s.model_type = "NPM"; s.density_min, s.density_max = K.TYPE_DEFAULTS["NPM"]; s.quadrant = "RB"; s.atlas_name = "Far"
+r = bpy.ops.tk.card_batch(min_length=1.0)
+print("npm batch", r, K._last_batch)
+assert r == {"FINISHED"} and K._last_batch["cards"] == 2, K._last_batch
+card = next(o for o in bpy.data.objects if o.name.endswith("_карточки"))
+uv = np.array([d.uv[:] for d in card.data.uv_layers[0].data])
+print("npm uv", uv.min(0), uv.max(0))
+assert uv[:, 0].min() >= 0.5 and uv[:, 0].max() <= 1.0 and uv[:, 1].min() >= 0.0 and uv[:, 1].max() <= 0.5
+assert card.data.materials[0].name.startswith("Far")
+a = K.M.image_array(bpy.data.images["Far_Opacity"])[..., 0]
+h = a.shape[0] // 2
+print("opacity per quarter LB/RB/LT/RT", a[:h, :h].mean(), a[:h, h:].mean(), a[h:, :h].mean(), a[h:, h:].mean())
+assert a[:h, h:].mean() > 0.001 and a[:h, :h].max() == 0 and a[h:].max() == 0

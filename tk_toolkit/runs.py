@@ -161,7 +161,22 @@ def split_runs(lines, gap=0.15):
         cu, cz, owner = [], [], []
         for i, p in enumerate(ps):
             u = p.pts[:, :2] @ ln["dir"]
-            cells = np.unique(np.stack([np.floor(u / gap), np.floor(p.pts[:, 2] / gap)], 1)
+            z = p.pts[:, 2]
+            # low-poly parts (a 40 m box rail has vertices only at its ends): fill the cells
+            # between points that are far apart along u, so the part counts as solid
+            o = np.argsort(u, kind="stable")
+            us, zs = u[o], z[o]
+            du = np.diff(us)
+            far = np.nonzero(du > gap)[0]
+            if len(far):
+                fu, fz = [us], [zs]
+                for j in far[:2000]:
+                    k = int(np.ceil(du[j] / (0.5 * gap)))
+                    t = np.linspace(0.0, 1.0, k + 1)[1:-1]
+                    fu.append(us[j] + t * du[j])
+                    fz.append(zs[j] + t * (zs[j + 1] - zs[j]))
+                us, zs = np.concatenate(fu), np.concatenate(fz)
+            cells = np.unique(np.stack([np.floor(us / gap), np.floor(zs / gap)], 1)
                               .astype(np.int64), axis=0)
             cu.append(cells[:, 0])
             cz.append(cells[:, 1])
@@ -213,27 +228,42 @@ def analyse_mesh(W, me):
 # Sub-mesh of selected polygons (fast, foreach based)
 # ---------------------------------------------------------------------------
 
-def submesh(me, poly_mask, name):
+def mesh_cache(me):
+    """Arrays of *me* read once and shared by many submesh() calls."""
+    npoly, nl, nv = len(me.polygons), len(me.loops), len(me.vertices)
+    c = {}
+    c["ls"] = np.empty(npoly, np.int64); me.polygons.foreach_get("loop_start", c["ls"])
+    c["lt"] = np.empty(npoly, np.int64); me.polygons.foreach_get("loop_total", c["lt"])
+    c["lv"] = np.empty(nl, np.int64); me.loops.foreach_get("vertex_index", c["lv"])
+    co = np.empty(nv * 3, np.float32); me.vertices.foreach_get("co", co)
+    c["co"] = co.reshape(-1, 3)
+    c["mi"] = np.empty(npoly, np.int32); me.polygons.foreach_get("material_index", c["mi"])
+    c["sm"] = np.empty(npoly, bool); me.polygons.foreach_get("use_smooth", c["sm"])
+    if me.uv_layers:
+        uv = np.empty(nl * 2, np.float32)
+        me.uv_layers[0].data.foreach_get("uv", uv)
+        c["uv"] = uv.reshape(-1, 2)
+        c["uvname"] = me.uv_layers[0].name
+    return c
+
+
+def submesh(me, poly_mask, name, cache=None):
     """New bpy Mesh made of the polygons where *poly_mask* is True (keeps materials, UVs
     of the first layer and smooth flags)."""
     import bpy
-    npoly = len(me.polygons)
-    ls = np.empty(npoly, np.int64)
-    lt = np.empty(npoly, np.int64)
-    me.polygons.foreach_get("loop_start", ls)
-    me.polygons.foreach_get("loop_total", lt)
-    lv = np.empty(len(me.loops), np.int64)
-    me.loops.foreach_get("vertex_index", lv)
+    c = cache if cache is not None else mesh_cache(me)
+    ls, lt, lv = c["ls"], c["lt"], c["lv"]
     pidx = np.nonzero(poly_mask)[0]
     tot = lt[pidx]
-    loops = np.concatenate([np.arange(ls[p], ls[p] + lt[p]) for p in pidx]) if len(pidx) else \
-        np.zeros(0, np.int64)
+    if len(pidx):
+        starts_new = np.concatenate([[0], np.cumsum(tot)[:-1]])
+        loops = np.repeat(ls[pidx] - starts_new, tot) + np.arange(int(tot.sum()))
+    else:
+        loops = np.zeros(0, np.int64)
     used_v = np.unique(lv[loops])
-    remap = np.full(len(me.vertices), -1, np.int64)
+    remap = np.full(len(c["co"]), -1, np.int64)
     remap[used_v] = np.arange(len(used_v))
-    co = np.empty(len(me.vertices) * 3, np.float32)
-    me.vertices.foreach_get("co", co)
-    co = co.reshape(-1, 3)[used_v]
+    co = c["co"][used_v]
     new = bpy.data.meshes.new(name)
     new.vertices.add(len(used_v))
     new.vertices.foreach_set("co", co.ravel())
@@ -247,19 +277,13 @@ def submesh(me, poly_mask, name):
             new.polygons.foreach_set("loop_total", tot.astype(np.int32))
         except (AttributeError, RuntimeError, TypeError):
             pass
-    mi = np.empty(npoly, np.int32)
-    me.polygons.foreach_get("material_index", mi)
-    new.polygons.foreach_set("material_index", mi[pidx])
-    sm = np.empty(npoly, bool)
-    me.polygons.foreach_get("use_smooth", sm)
-    new.polygons.foreach_set("use_smooth", sm[pidx])
+    new.polygons.foreach_set("material_index", c["mi"][pidx])
+    new.polygons.foreach_set("use_smooth", c["sm"][pidx])
     for m in me.materials:
         new.materials.append(m)
-    if me.uv_layers:
-        uv = np.empty(len(me.loops) * 2, np.float32)
-        me.uv_layers[0].data.foreach_get("uv", uv)
-        nl = new.uv_layers.new(name=me.uv_layers[0].name)
-        nl.data.foreach_set("uv", uv.reshape(-1, 2)[loops].ravel())
+    if "uv" in c:
+        nl = new.uv_layers.new(name=c["uvname"])
+        nl.data.foreach_set("uv", c["uv"][loops].ravel())
     new.update(calc_edges=True)
     new.validate(verbose=False)
     return new

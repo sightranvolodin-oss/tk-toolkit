@@ -45,7 +45,7 @@ class TK_SplitSettings(bpy.types.PropertyGroup):
         description="На время экспорта ставить кусок в (0,0,0)")
 
     highlight: BoolProperty(
-        name="Подсветка материала", default=True,
+        name="Подсветка материала", default=False,
         description="Подсвечивать во вьюпорте геометрию выбранного в списке материала "
                     "(и отмеченных галочками)",
         update=lambda self, ctx: C.tag_redraw_3d())
