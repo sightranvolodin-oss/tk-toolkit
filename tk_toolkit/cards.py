@@ -1933,6 +1933,7 @@ class TK_PT_cards(bpy.types.Panel):
         col.scale_y = 1.2
         col.operator("tk.card_batch", icon="MOD_ARRAY")
         box.prop(s, "batch_rest")
+        box.operator("tk.card_repack", icon="UV_SYNC_SELECT")
         if _last_batch:
             box.label(text=f"Веток {_last_batch['runs']}, карточек {_last_batch['cards']}, "
                            f"типов {len(_last_batch.get('types', []))}, "
@@ -2503,12 +2504,266 @@ class TK_OT_card_batch(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
+# ---------------------------------------------------------------------------
+# Repack: several finished (non-repeating) cards into ONE quarter, no rebake
+# ---------------------------------------------------------------------------
+
+def _resample_axis(a, n, axis):
+    """Exact area-average resampling of *a* to length *n* along *axis*."""
+    a = np.moveaxis(a, axis, 0)
+    m = a.shape[0]
+    c = np.concatenate([np.zeros((1,) + a.shape[1:], a.dtype), np.cumsum(a, axis=0)], 0)
+    e = np.linspace(0.0, m, n + 1)
+    i = np.minimum(np.floor(e).astype(int), m - 1)
+    f = (e - i)[(...,) + (None,) * (a.ndim - 1)]
+    C = c[i] + (c[i + 1] - c[i]) * f                  # integral up to each edge
+    out = (C[1:] - C[:-1]) / (e[1:] - e[:-1])[(...,) + (None,) * (a.ndim - 1)]
+    return np.moveaxis(out, 0, axis)
+
+
+def resample(a, h, w):
+    return _resample_axis(_resample_axis(a, h, 0), w, 1)
+
+
+def card_islands(ob):
+    """UV islands of a card (pieces): list of dicts with faces, slot, uv bbox. Raises
+    ValueError for cards whose UVs leave 0…1 (tiled ВПМ cards repeat the texture)."""
+    me = ob.data
+    uvl = me.uv_layers.active
+    if uvl is None:
+        raise ValueError("нет UV")
+    nl = len(me.loops)
+    uv = np.empty(nl * 2, np.float32)
+    uvl.data.foreach_get("uv", uv)
+    uv = uv.reshape(-1, 2)
+    if uv.size and (uv.min() < -1e-4 or uv.max() > 1.0 + 1e-4):
+        raise ValueError("карточка с повтором текстуры (ВПМ) — её не переупаковать, "
+                         "только перезапечь в НПМ")
+    faces = []
+    for p in me.polygons:
+        li = list(p.loop_indices)
+        b = uv[li]
+        faces.append((p.index, p.material_index, b.min(0), b.max(0)))
+    # faces whose UV boxes touch belong to one island (pieces are ≥ GUTTER px apart)
+    n = len(faces)
+    par = list(range(n))
+
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+    eps = 1e-5
+    order = sorted(range(n), key=lambda k: faces[k][2][0])
+    for a_i, ia in enumerate(order):
+        fa = faces[ia]
+        for ib in order[a_i + 1:]:
+            fb = faces[ib]
+            if fb[2][0] > fa[3][0] + eps:
+                break
+            if fa[1] == fb[1] and fb[2][1] <= fa[3][1] + eps and fa[2][1] <= fb[3][1] + eps:
+                par[find(ia)] = find(ib)
+    groups = {}
+    for k in range(n):
+        groups.setdefault(find(k), []).append(k)
+    out = []
+    for ks in groups.values():
+        lo = np.min([faces[k][2] for k in ks], 0)
+        hi = np.max([faces[k][3] for k in ks], 0)
+        out.append({"faces": [faces[k][0] for k in ks], "slot": faces[ks[0]][1],
+                    "lo": lo, "hi": hi})
+    return out, uv
+
+
+def slot_images(ob, slot):
+    """{channel: Image} of a card material slot (atlas images named <atlas>_<Channel>)."""
+    if slot >= len(ob.material_slots) or ob.material_slots[slot].material is None:
+        return {}
+    mat = ob.material_slots[slot].material
+    out = {}
+    if not mat.node_tree:
+        return out
+    for nd in mat.node_tree.nodes:
+        if nd.bl_idname == "ShaderNodeTexImage" and nd.image:
+            for ch, spec in M.CHANNELS.items():
+                if nd.image.name.endswith(spec[1]):
+                    out[ch] = nd.image
+    return out
+
+
+def island_density(ob, isl, uv, tile_px):
+    """px per metre of an island, measured on its faces (UV length / 3D length)."""
+    me = ob.data
+    mw = ob.matrix_world
+    r = []
+    for fi in isl["faces"]:
+        p = me.polygons[fi]
+        li = list(p.loop_indices)
+        vs = [mw @ me.vertices[me.loops[l].vertex_index].co for l in li]
+        for k in range(len(li)):
+            a, b = li[k], li[(k + 1) % len(li)]
+            L = (vs[(k + 1) % len(li)] - vs[k]).length
+            if L > 1e-3:
+                r.append(float(np.linalg.norm((uv[b] - uv[a]) * tile_px)) / L)
+    return float(np.median(r)) if r else 0.0
+
+
+def repack_cards(context, objs, s, op=None):
+    """Move the texture pieces of *objs* (finished non-repeating cards) into one quarter
+    of the atlas s.atlas_name at one common density. Returns (density, n_islands)."""
+    tile = int(s.tile_size)
+    area = area_rect(tile, "NPM", s.quadrant)
+    x0, y0, aw, ah = area
+    items = []                     # (ob, island, images, src_tile, px rect, density)
+    for ob in objs:
+        isls, uv = card_islands(ob)
+        for isl in isls:
+            imgs = slot_images(ob, isl["slot"])
+            if "OPACITY" not in imgs and "DIFFUSE" not in imgs:
+                raise ValueError(f"{ob.name}: не нашёл текстур карточки в материале")
+            st = next(iter(imgs.values())).size[0]
+            rx0 = int(math.floor(isl["lo"][0] * st + 1e-4))
+            ry0 = int(math.floor(isl["lo"][1] * st + 1e-4))
+            rx1 = int(math.ceil(isl["hi"][0] * st - 1e-4))
+            ry1 = int(math.ceil(isl["hi"][1] * st - 1e-4))
+            rx1, ry1 = max(rx1, rx0 + 1), max(ry1, ry0 + 1)
+            d = island_density(ob, isl, uv, st)
+            items.append((ob, isl, imgs, st, (rx0, ry0, rx1, ry1), d, uv))
+    if not items:
+        raise ValueError("нечего паковать")
+    d_src_min = min(it[5] for it in items if it[5] > 0)
+    d_hi = min(s.density_max, d_src_min)          # never stretch above the source
+    if d_hi < s.density_min:
+        d_hi = s.density_min
+
+    def layout(d):
+        sizes = []
+        for it in items:
+            rx0, ry0, rx1, ry1 = it[4]
+            k = d / it[5] if it[5] > 0 else 1.0
+            sizes.append((max(1, math.ceil((rx1 - rx0) * k)), max(1, math.ceil((ry1 - ry0) * k))))
+        order = sorted(range(len(items)), key=lambda i: (-sizes[i][1], -sizes[i][0]))
+        pos = [None] * len(items)
+        x = y = sh = 0
+        for i in order:
+            w, h = sizes[i]
+            if x + w > aw:
+                x, y, sh = 0, y + sh + GUTTER, 0
+            if w > aw or y + h > ah:
+                return None, sizes
+            pos[i] = (x, y)
+            x += w + GUTTER
+            sh = max(sh, h)
+        return pos, sizes
+
+    d = d_hi
+    pos = None
+    while d >= s.density_min - 1e-6:
+        pos, sizes = layout(d)
+        if pos is not None:
+            break
+        d *= 0.97
+    if pos is None:
+        need = sum(w * h for w, h in layout(s.density_min)[1])
+        raise ValueError(f"не влезает в четверть {aw}×{ah} даже при {s.density_min:g} px/м "
+                         f"(нужно ~{need / (aw * ah) * 100:.0f}% площади четверти) — возьмите "
+                         f"тайл 4096 или разнесите карточки по двум четвертям")
+    # compose the quarter
+    cache = {}
+
+    def arr(img):
+        if img.name not in cache:
+            cache[img.name] = M.image_array(img)
+        return cache[img.name]
+    chans = sorted({ch for it in items for ch in it[2]}, key=M.ORDER.index)
+    acc = {}
+    for ch in chans:
+        a = np.zeros((ah, aw, 4), np.float32)
+        if ch != "OPACITY":
+            a[..., :3] = M.DEFAULT_FILL[ch]
+        a[..., 3] = 1.0 if ch != "DIFFUSE" else 0.0
+        acc[ch] = a
+    for it, (px, py), (w, h) in zip(items, pos, sizes):
+        ob, isl, imgs, st, (rx0, ry0, rx1, ry1), d_src, uv = it
+        op = None
+        if "OPACITY" in imgs:
+            op = resample(arr(imgs["OPACITY"])[ry0:ry1, rx0:rx1], h, w)
+            acc["OPACITY"][py:py + h, px:px + w] = op
+        for ch in chans:
+            if ch == "OPACITY" or ch not in imgs:
+                continue
+            src = arr(imgs[ch])[ry0:ry1, rx0:rx1]
+            if op is not None:
+                wsrc = arr(imgs["OPACITY"])[ry0:ry1, rx0:rx1][..., :1]
+                num = resample(src * wsrc, h, w)
+                den = resample(wsrc, h, w)
+                blk = np.where(den > 1e-6, num / np.maximum(den, 1e-6), resample(src, h, w))
+            else:
+                blk = resample(src, h, w)
+            acc[ch][py:py + h, px:px + w] = blk
+        # UVs: same piece, new place and scale
+        sx, sy = w / (rx1 - rx0), h / (ry1 - ry0)
+        me = ob.data
+        for fi in isl["faces"]:
+            for li in me.polygons[fi].loop_indices:
+                u_px, v_px = uv[li][0] * st, uv[li][1] * st
+                uv[li] = ((x0 + px + (u_px - rx0) * sx) / tile,
+                          (y0 + py + (v_px - ry0) * sy) / tile)
+    finish_maps(acc, s)
+    sl = (slice(y0, y0 + ah), slice(x0, x0 + aw))
+    images = write_atlas(s.atlas_name, acc, tile, sl)
+    if s.save_files and op is not None:
+        TK_OT_card_make._save(op, s, images)
+    mat = card_material(s.atlas_name, images)
+    done = set()
+    for it in items:
+        ob = it[0]
+        if ob.name in done:
+            continue
+        done.add(ob.name)
+        me = ob.data
+        me.uv_layers.active.data.foreach_set("uv", it[6].ravel())
+        mi = np.zeros(len(me.polygons), np.int32)
+        me.polygons.foreach_set("material_index", mi)
+        me.materials.clear()
+        me.materials.append(mat)
+        me.update()
+        ob["tk_card_density"] = d
+    return d, len(items)
+
+
+class TK_OT_card_repack(bpy.types.Operator):
+    bl_idname = "tk.card_repack"
+    bl_label = "Упаковать в одну четверть"
+    bl_description = ("Собрать текстуры выделенных готовых карточек в выбранную четверть "
+                      "одного атласа (без перезапекания): одна плотность в пределах «от–до», "
+                      "UV и материалы меняются, геометрия карточек — нет")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s = context.scene.tk_card
+        objs = [o for o in context.selected_objects if o.type == "MESH"]
+        if not objs:
+            self.report({"WARNING"}, "Выделите готовые карточки")
+            return {"CANCELLED"}
+        try:
+            d, n = repack_cards(context, objs, s, self)
+        except ValueError as ex:
+            self.report({"ERROR"}, f"Не упаковалось: {ex}")
+            return {"CANCELLED"}
+        q = s.bl_rna.properties["quadrant"].enum_items[s.quadrant].name
+        self.report({"INFO"}, f"Упаковано {n} кусков из {len(objs)} карточек в четверть «{q}» "
+                              f"атласа «{s.atlas_name}», {d:.1f} px/м")
+        return {"FINISHED"}
+
+
 _last_texture = {}
 _last_batch = {}
 _SAMPLES = {"n": 200000}
 
 
-classes = (TK_CardSettings, TK_OT_card_analyse, TK_OT_card_make, TK_OT_card_batch, TK_PT_cards)
+classes = (TK_CardSettings, TK_OT_card_analyse, TK_OT_card_make, TK_OT_card_batch,
+           TK_OT_card_repack, TK_PT_cards)
 
 
 def register():
