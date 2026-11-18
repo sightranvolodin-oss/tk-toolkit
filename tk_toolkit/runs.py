@@ -142,16 +142,17 @@ def attach_small(parts, lines, dist=0.15, margin=0.5):
     for p in parts:
         if p.line >= 0:
             continue
-        best, bd = -1, dist
+        # a line of the part's own material wins; otherwise any (a railing may well be
+        # posts of one material and rails of another)
+        best, bd, best_same = -1, dist, False
         for k, ln in enumerate(lines):
-            if ln.get("mat", p.mat) != p.mat:
-                continue
             u = p.center @ ln["dir"]
             if u < ln["u0"] - margin or u > ln["u1"] + margin:
                 continue
             dd = abs(p.center @ ln["nrm"] - ln["offset"])
-            if dd < bd:
-                best, bd = k, dd
+            same = ln.get("mat", p.mat) == p.mat
+            if dd < dist and ((same and not best_same) or (same == best_same and dd < bd)):
+                best, bd, best_same = k, dd, same
         if best >= 0:
             p.line = best
             lines[best]["parts"].append(p)
@@ -242,9 +243,7 @@ def bar_rows(left, runs, step_max=0.35, min_bars=3):
     a, b = [], []
     for i in range(n):                                  # small n (leftovers only)
         d = np.linalg.norm(C[:, :2] - C[i, :2], axis=1)
-        mats = np.array([q.mat for q in vert])
-        m = ((d < step_max) & (np.abs(C[:, 2] - C[i, 2]) < 0.3) & (np.arange(n) > i)
-             & (mats == vert[i].mat))
+        m = (d < step_max) & (np.abs(C[:, 2] - C[i, 2]) < 0.3) & (np.arange(n) > i)
         js = np.nonzero(m)[0]
         a += [i] * len(js)
         b += js.tolist()
