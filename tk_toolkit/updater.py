@@ -6,6 +6,7 @@ import re
 import ssl
 import tempfile
 import urllib.request
+import urllib.parse
 
 import bpy
 from bpy.props import BoolProperty, StringProperty
@@ -57,23 +58,46 @@ def _get(url, timeout=15):
         return r.read()
 
 
+def _latest_via_web(repo):
+    """Latest release without the GitHub API (its 60 requests/hour limit is per IP and is
+    often used up by others on the same network): github.com/<repo>/releases/latest
+    redirects to …/releases/tag/<tag>, and the zip has a fixed name."""
+    req = urllib.request.Request(f"https://github.com/{repo}/releases/latest",
+                                 headers={"User-Agent": "tk-toolkit-updater"})
+    with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as r:
+        final = r.geturl()
+    if "/releases/tag/" not in final:
+        raise RuntimeError("404: no releases")
+    tag = final.rsplit("/releases/tag/", 1)[1].split("?")[0].strip("/")
+    tag = urllib.parse.unquote(tag)
+    ver = tag.lstrip("v")
+    url = f"https://github.com/{repo}/releases/download/{tag}/tk_toolkit-{ver}.zip"
+    return tag, url, f"Список изменений: https://github.com/{repo}/releases/tag/{tag}"
+
+
 def check(repo):
     """Fill _state from the repo's latest release. Returns True if newer exists."""
     _state.update(latest=None, url=None, notes="", error="", checked=True)
     try:
         data = json.loads(_get(f"https://api.github.com/repos/{repo}/releases/latest"))
-    except Exception as ex:  # network, 404 when no releases yet, rate limit…
-        msg = str(ex)
-        if "404" in msg:
-            msg = "в репозитории пока нет релизов"
-        _state["error"] = msg
-        return False
-    tag = data.get("tag_name", "")
-    asset = next((a for a in data.get("assets", []) if a.get("name", "").endswith(".zip")), None)
+        tag = data.get("tag_name", "")
+        asset = next((a for a in data.get("assets", [])
+                      if a.get("name", "").endswith(".zip")), None)
+        url = asset.get("browser_download_url") if asset else None
+        notes = (data.get("body") or "").strip()
+    except Exception as ex:  # rate limit (403/429), API down… → plain github.com
+        try:
+            tag, url, notes = _latest_via_web(repo)
+        except Exception as ex2:
+            msg = str(ex2)
+            if "404" in msg or "404" in str(ex):
+                msg = "в репозитории пока нет релизов"
+            _state["error"] = msg
+            return False
     _state["latest"] = tag.lstrip("v")
-    _state["url"] = asset.get("browser_download_url") if asset else None
-    _state["notes"] = (data.get("body") or "").strip()
-    if asset is None:
+    _state["url"] = url
+    _state["notes"] = notes
+    if not url:
         _state["error"] = "в последнем релизе нет zip-файла"
     return parse_version(_state["latest"]) > parse_version(current_version())
 
