@@ -299,6 +299,16 @@ class _SceneForBake:
         self.obj.hide_set(False)
         self.obj.hide_render = False
         self.extra_hidden = [(o, o.hide_get(), o.hide_render) for o in self.extra]
+        # Cycles syncs every renderable object of the scene: on heavy scenes that is
+        # gigabytes for nothing. Only the objects taking part in the bake stay renderable.
+        involved = {self.obj.name} | {o.name for o in self.extra}
+        self.muted = []
+        for o in self.ctx.scene.objects:
+            if o.name not in involved and not o.hide_render and o.type in {
+                    "MESH", "CURVE", "SURFACE", "META", "FONT", "VOLUME", "POINTCLOUD",
+                    "CURVES", "GPENCIL", "GREASEPENCIL"}:
+                o.hide_render = True
+                self.muted.append(o)
         for o in self.extra:
             o.hide_set(False)
             o.hide_render = False
@@ -318,6 +328,11 @@ class _SceneForBake:
             self.obj.hide_render = self.hide_render
         except ReferenceError:
             pass
+        for o in self.muted:
+            try:
+                o.hide_render = False
+            except ReferenceError:
+                pass
         for o, h, hr in self.extra_hidden:
             try:
                 o.select_set(False)

@@ -67,6 +67,10 @@ class TK_CardSettings(bpy.types.PropertyGroup):
         ("NONE", "Без повтора", "Запечь весь объект целиком, без тайлинга"),
     ], default="AUTO")
     period: FloatProperty(name="Пролёт", default=2.5, min=0.01, subtype="DISTANCE")
+    fit_sections: BoolProperty(
+        name="Подгонять шаг по участкам", default=True,
+        description="На каждом марше / площадке свой шаг стоек: повтор текстуры слегка "
+                    "растягивается под него, и стойки встают на свои места")
     max_tiles: bpy.props.IntProperty(
         name="Максимум тайлов", default=1, min=1, max=64,
         description="ВПМ без повтора: на сколько тайлов можно разложить объект, "
@@ -357,10 +361,11 @@ def top_profile(pu, pz, u0, u1, cell=0.05, tol=0.03):
     need = max(0.1, 0.25 * bh)
     if bh <= 0 or float(np.ptp(top)) < need or float(np.ptp(bot)) < need:
         return None                            # practically flat
-    if float(np.percentile(np.abs(band - bh), 90)) > 0.1 * bh:
+    # most of the length must keep the band height (end gates / single posts may not)
+    if float(np.percentile(np.abs(band - bh), 75)) > 0.1 * bh:
         return None                            # the band doesn't keep its height
     dt, db = top - top.mean(), bot - bot.mean()
-    if dt.std() == 0 or db.std() == 0 or float(np.corrcoef(dt, db)[0, 1]) < 0.9:
+    if dt.std() == 0 or db.std() == 0 or float(np.corrcoef(dt, db)[0, 1]) < 0.85:
         return None                            # top and bottom don't rise together
     xs = np.concatenate([[u0], xs, [u1]])
     top = np.concatenate([[top[0]], top, [top[-1]]])
@@ -749,6 +754,103 @@ def write_atlas(atlas, crop, tile, sl):
     return images
 
 
+def fit_local_period(pu, a, b, P0, rel=0.12, nfold=64):
+    """Best period near *P0* and the position of a bar (densest column) inside [a, b).
+    Returns (P, phase_u, sharpness) or (P0, None, 0) when the section is too short."""
+    m = (pu >= a) & (pu < b)
+    x = pu[m]
+    if len(x) < 300 or (b - a) < 1.5 * P0:
+        return P0, None, 0.0
+    cands = np.linspace(P0 * (1 - rel), P0 * (1 + rel), 241)
+    best = (0.0, P0, 0)
+    for P in cands:
+        h = np.bincount((((x - a) / P) % 1.0 * nfold).astype(int), minlength=nfold)
+        sc = h.max() / max(h.mean(), 1e-9)
+        if sc > best[0]:
+            best = (sc, P, int(np.argmax(h)))
+    sc, P, k = best
+    return float(P), float(a + (k + 0.5) / nfold * P), float(sc)
+
+
+def _sharpness(x, a, P, nfold=64):
+    h = np.bincount((((x - a) / P) % 1.0 * nfold).astype(int), minlength=nfold)
+    return h.max() / max(h.mean(), 1e-9), int(np.argmax(h))
+
+
+def bars_per_period(pu, a, b, P):
+    """How many equally spaced bars one period holds (1…4): folding at P/m keeps the
+    bars stacked only while m divides their count."""
+    m_ = (pu >= a) & (pu < b)
+    x = pu[m_]
+    if len(x) < 300:
+        return 1
+    nf = 64
+    s1, _ = _sharpness(x, a, P, nf)
+    h1 = np.bincount((((x - a) / P) % 1.0 * nf).astype(int), minlength=nf).astype(float)
+    k1 = int(np.argmax(h1))
+    def slot(k):
+        return sum(h1[(k + d) % nf] for d in (-1, 0, 1))
+    for m in (4, 3, 2):
+        sm, _ = _sharpness(x, a, P / m)
+        if sm < 0.8 * s1:
+            continue
+        # the m bars of one period must be alike (a post among pickets is not "m bars")
+        v = [slot(int(round(k1 + i * nf / m))) for i in range(m)]
+        if min(v) >= 0.75 * max(v):
+            return m
+    return 1
+
+
+def fit_bar_step(pu, a, b, step0, lo=0.55, hi=1.8, nfold=64):
+    """Bar step of a section, searched widely around *step0*. Sub-multiples of the true
+    step stack the bars just as well, so the LARGEST step that still stacks them wins.
+    Returns (step, phase_u, sharpness) or (step0, None, 0)."""
+    m_ = (pu >= a) & (pu < b)
+    x = pu[m_]
+    if len(x) < 300 or (b - a) < 2.5 * step0:
+        return step0, None, 0.0
+    cands = np.linspace(step0 * lo, step0 * hi, 500)
+    sc = np.empty(len(cands))
+    ks = np.empty(len(cands), int)
+    for i, P in enumerate(cands):
+        sc[i], ks[i] = _sharpness(x, a, P, nfold)
+    good = np.nonzero(sc >= 0.8 * sc.max())[0]
+    # among the good ones take the largest step, refined to its local maximum
+    j = good[-1]
+    while j > 0 and sc[j - 1] > sc[j]:
+        j -= 1
+    lo_j = j
+    while lo_j > 0 and sc[lo_j - 1] >= 0.8 * sc.max():
+        lo_j -= 1
+    j = lo_j + int(np.argmax(sc[lo_j:good[-1] + 1]))
+    P = float(cands[j])
+    return P, float(a + (ks[j] + 0.5) / nfold * P), float(sc[j])
+
+
+def fit_sections(info, P_ref, m=None):
+    """Per-section (between profile breakpoints) period (= m bar steps) and bar phase."""
+    pu, _pz = info["samples"]
+    if m is None:
+        m = info.get("bars_per_period", 1)
+    step0 = P_ref / m
+    if info.get("profile") is not None:
+        cuts = list(info["profile"][0])
+    else:
+        cuts = [info["u0"], info["u1"]]
+    secs = []
+    for a, b in zip(cuts[:-1], cuts[1:]):
+        st, ph, sc = fit_bar_step(pu, a, b, step0)
+        secs.append({"a": float(a), "b": float(b), "P": st * m, "phase": ph, "score": sc})
+    # sections too short to measure take the phase from a neighbour and the reference step
+    for i, sct in enumerate(secs):
+        if sct["phase"] is None:
+            sct["P"] = P_ref
+            nb = next((secs[j] for j in (i - 1, i + 1) if 0 <= j < len(secs)
+                       and secs[j]["phase"] is not None), None)
+            sct["phase"] = nb["phase"] if nb else info["u0"]
+    return secs
+
+
 def typical_segment(info, seg):
     """Start of the most typical seg-long window (aligned to the period), so odd parts
     like corner posts or a brace don't get repeated along the whole card."""
@@ -769,8 +871,15 @@ def typical_segment(info, seg):
                                  range=((0, seg), (info["z0"], info["z1"])))
         wins.append(h)
     W = np.array(wins)
-    med = np.median(W, axis=0)
-    dev = np.abs(W - med).sum(axis=(1, 2))
+    mass = W.sum(axis=(1, 2))
+    ok = mass >= 0.7 * np.median(mass)            # skip sparse windows (ends, gaps)
+    if n > 4:
+        ok[0] = ok[-1] = False                    # and the very ends (returns, end posts)
+    if not ok.any():
+        ok[:] = True
+    med = np.median(W[ok], axis=0)
+    dev = np.abs(W - med).sum(axis=(1, 2)) / np.maximum(mass, 1)
+    dev[~ok] = np.inf
     j = int(np.argmin(dev))
     return u0 + j * per
 
@@ -796,6 +905,203 @@ def straightened_copies(context, objs, info):
         context.scene.collection.objects.link(t)
         out.append(t)
     return out
+
+
+def detect_bars(info, step0):
+    """u positions of the vertical bars (balusters, posts), from the surface density in the
+    middle of the band, between the rails. Straightened space."""
+    pu, pz = info["samples"]
+    z0, z1 = info["z0"], info["z1"]
+    H = z1 - z0
+    m = (pz > z0 + 0.25 * H) & (pz < z1 - 0.25 * H)
+    x = pu[m]
+    if len(x) < 200:
+        return np.zeros(0)
+    cell = min(0.005, step0 / 20)
+    nb = max(10, int(math.ceil((info["u1"] - info["u0"]) / cell)))
+    h, e = np.histogram(x, bins=nb, range=(info["u0"], info["u1"]))
+    w = max(3, int(round(min(0.25 * step0, 0.03) / cell)) | 1)   # merges the sides of a bar
+    h = np.convolve(h.astype(float), np.ones(w) / w, mode="same")
+    thr = 0.25 * np.percentile(h[h > 0], 95) if (h > 0).any() else 1
+    pk = np.nonzero((h[1:-1] >= h[:-2]) & (h[1:-1] > h[2:]) & (h[1:-1] > thr))[0] + 1
+    if len(pk) == 0:
+        return np.zeros(0)
+    # one peak per bar: strongest first, nothing else within 60 % of a step
+    rad = 0.6 * step0 / cell
+    taken = []
+    for q in pk[np.argsort(-h[pk], kind="stable")]:
+        if all(abs(q - t) >= rad for t in taken):
+            taken.append(q)
+    taken.sort()
+    c = (e[:-1] + e[1:]) / 2
+    # bar centre = density centroid around the peak (thick posts have two side faces)
+    r = max(1, int(min(0.2 * step0, 0.15) / cell))
+    raw = np.histogram(x, bins=nb, range=(info["u0"], info["u1"]))[0].astype(float)
+    out = []
+    for q in taken:
+        for _ in range(2):
+            lo, hi = max(0, q - r), min(nb, q + r + 1)
+            wsum = raw[lo:hi].sum()
+            if wsum <= 0:
+                break
+            q = int(round((raw[lo:hi] * np.arange(lo, hi)).sum() / wsum))
+        out.append(float(c[min(max(q, 0), nb - 1)]))
+    return np.array(out)
+
+
+def bar_grid(peaks, step0):
+    """Turn detected peaks into a bar sequence with integer indices: off-grid peaks (posts at
+    breaks, brackets) are dropped, missing bars are bridged. The local step may drift slowly
+    (sections of one railing differ by a few per cent)."""
+    if len(peaks) < 2:
+        return np.zeros(0), np.zeros(0, int)
+    xs, ix = [float(peaks[0])], [0]
+    st = step0
+    for x in peaks[1:]:
+        g = x - xs[-1]
+        n = g / st
+        if n < 0.65:
+            # two candidates for one slot: keep the one on the grid of the previous bar
+            if len(xs) >= 2:
+                ref = xs[-2] + st * (ix[-1] - ix[-2])
+                if abs(x - ref) < abs(xs[-1] - ref):
+                    xs[-1] = float(x)
+            continue
+        kk = int(round(n))
+        if abs(n - kk) > 0.3:
+            continue                                   # off-grid
+        xs.append(float(x))
+        ix.append(ix[-1] + kk)
+        if kk == 1:
+            st = float(np.clip(0.7 * st + 0.3 * g, 0.8 * step0, 1.25 * step0))
+    return np.array(xs), np.array(ix)
+
+
+def bar_card_uvs(card, info, m, k, off=0.5):
+    """Cut the card at every bar and map texture bars onto the real bars one by one:
+    model bar with index j ↔ texture bar at t = off + (j + c)/m periods (U = t / k)."""
+    import bmesh
+    peaks = info.get("bars")
+    if peaks is None or len(peaks) < 3:
+        return False
+    P = info["period"]
+    gap = float(np.median(np.diff(peaks)))
+    if not 0.8 * P / m < gap < 1.25 * P / m:
+        return False                                   # peaks are not the bars of this step
+    bars, idx = bar_grid(peaks, P / m)
+    if len(bars) < 3 or len(bars) < 0.7 * len(peaks):
+        return False
+    # a perfectly regular railing needs no cuts: the card's own UVs already fit
+    A = np.vstack([idx, np.ones(len(idx))]).T
+    (slope, icpt), *_ = np.linalg.lstsq(A, bars, rcond=None)
+    resid = np.abs(bars - (slope * idx + icpt)).max()
+    if abs(slope - P / m) < 0.003 * P / m and resid < max(0.004, 0.03 * P / m) \
+            and info.get("profile") is None and (info.get("texture") or {}).get("s0") is not None:
+        return True
+    L = m * k
+    tex = info.get("texture") or {}
+    tb = None
+    c = 0
+    s0 = tex.get("s0")
+    if s0 is not None and "tb" not in tex:
+        # this run was baked: measure where the bars landed in the texture with the same
+        # detector, so its bias cancels out
+        inw = np.nonzero((bars >= s0 - 1e-6) & (bars < s0 + k * P - 1e-6))[0]
+        if len(inw) == L and np.all(np.diff(idx[inw]) == 1):
+            tb = (bars[inw] - s0) / P                 # in periods, 0…k
+            c = -int(idx[inw[0]])
+            info["tb"] = tb
+    elif tex.get("tb") is not None and len(tex["tb"]) == L:
+        tb = np.asarray(tex["tb"])
+    if tb is None or m > 1:
+        if m > 1:
+            secs = fit_sections(info, P, m)
+            sec = next((x for x in secs if x["a"] <= bars[0] <= x["b"]), secs[0])
+            c0 = int(round((bars[0] - sec["phase"]) / sec["P"] * m)) % m
+            if tb is None or s0 is None or "tb" in tex:
+                c = c0
+    if tb is None:
+        tb = off + np.arange(L) / m
+
+    def tex_t(g):
+        """texture position (periods) of bar grid index g (real-valued)."""
+        g0 = math.floor(g)
+        f = g - g0
+        def at(i):
+            return tb[i % L] + (i // L) * k
+        return at(g0) + f * (at(g0 + 1) - at(g0))
+    U = Vector(info["u"])
+    me = card.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    for x in bars:
+        geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
+        bmesh.ops.bisect_plane(bm, geom=geom, plane_co=U * float(x), plane_no=U)
+    uvl = bm.loops.layers.uv.active
+    jj = idx.astype(float) + c
+
+    def t_at(u, j):
+        """u inside bar interval j (−1 = before the first bar, len−1 = after the last)."""
+        if j < 0:
+            g = (bars[1] - bars[0]) / (idx[1] - idx[0])
+            return tex_t(jj[0]) + (u - bars[0]) / g / m
+        if j >= len(bars) - 1:
+            g = (bars[-1] - bars[-2]) / (idx[-1] - idx[-2])
+            return tex_t(jj[-1]) + (u - bars[-1]) / g / m
+        f = (u - bars[j]) / (bars[j + 1] - bars[j])
+        return tex_t(jj[j] + f * (jj[j + 1] - jj[j]))
+
+    for f in bm.faces:
+        uc = f.calc_center_median().dot(U)
+        j = int(np.searchsorted(bars, uc, side="right") - 1)
+        for lp in f.loops:
+            lp[uvl].uv.x = t_at(lp.vert.co.dot(U), j) / k
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+    return True
+
+
+def fit_card_uvs(card, info):
+    """Re-map U on every section so the texture repeat lands on that section's own bars."""
+    import bmesh
+    p = info["plan"]
+    k = max(1, p["spans"])
+    # smallest number of bars per period whose step the detected bars actually follow
+    P = info["period"]
+    for m in (range(1, 17) if not os.environ.get("TK_NOBARS") else ()):
+        if P / m < 0.04:
+            break
+        bars = detect_bars(info, P / m)
+        if len(bars) < 3:
+            continue
+        info["bars"] = bars
+        if bar_card_uvs(card, info, m, k, info.get("bar_offset", 0.5)):
+            if info.get("texture") is not None and info.get("tb") is not None:
+                info["texture"]["tb"] = info["tb"]
+                info["texture"]["m"] = m
+            return
+    secs = fit_sections(info, info["period"])
+    info["sections"] = secs
+    U = Vector(info["u"])
+    me = card.data
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    if info.get("profile") is None:
+        # no breakpoints yet: cut the card where sections change (here: nowhere)
+        pass
+    uvl = bm.loops.layers.uv.active
+    off = info.get("bar_offset", 0.5)
+    for f in bm.faces:
+        uc = f.calc_center_median().dot(U)
+        sec = next((x for x in secs if x["a"] - 1e-6 <= uc <= x["b"] + 1e-6), secs[-1])
+        for lp in f.loops:
+            u = lp.vert.co.dot(U)
+            t = (u - sec["phase"]) / sec["P"] + off       # in periods; bars at t = off
+            lp[uvl].uv.x = t / k
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
 
 
 def warp_to_profile(card, info):
@@ -830,7 +1136,7 @@ def analyse(context, s):
     if not objs:
         raise RuntimeError("Выделите геометрию (забор, решётку…)")
     dg = context.evaluated_depsgraph_get()
-    pts = gather_points(objs, dg)
+    pts = gather_points(objs, dg, samples=_SAMPLES["n"])
     if len(pts) == 0:
         raise RuntimeError("У выделенных объектов нет граней")
     u, z, n = card_frame(pts, s.side)
@@ -861,6 +1167,12 @@ def analyse(context, s):
     info["height"] = info["z1"] - info["z0"]
     info["samples"] = (pu, pz)
     info["thickness"] = info["n1"] - info["n0"]
+    # the card stands where the bars are (middle of the band), not in the middle of the
+    # bounding box: a handrail sticking out would put it in front of the bars → parallax
+    H_ = info["z1"] - info["z0"]
+    mid = (pz > info["z0"] + 0.25 * H_) & (pz < info["z1"] - 0.25 * H_)
+    nm = float(np.median(pn[mid])) if mid.sum() > 100 else info.get("n_card", (info["n0"] + info["n1"]) / 2)
+    info["n_card"] = min(max(nm, info["n0"]), info["n1"])
     score = 0.0
     info["period_rejected"] = None
     if s.period_mode == "AUTO":
@@ -971,7 +1283,11 @@ class TK_OT_card_make(bpy.types.Operator):
         card = res
         if info["profile"] is not None:
             warp_to_profile(card, info)
+        p_ = info["plan"]
+        if s.fit_sections and p_["tiled"] and p_["wrap"] and "bar_offset" in info:
+            fit_card_uvs(card, info)
         card["tk_card_density"] = info["plan"]["density"]
+        _last_texture["tex"] = info.get("texture") if info["plan"]["tiled"] else None
         return self._finish(context, s, originals, card, lines, warns)
 
     def _make(self, context, s, info, lines, warns):
@@ -987,6 +1303,22 @@ class TK_OT_card_make(bpy.types.Operator):
         # segment to bake: start where a whole number of periods begins near the middle
         if p["tiled"]:
             s0 = typical_segment(info, seg)
+            if s.fit_sections:
+                # bake exactly k bars of the local step, window starting between two bars
+                pu_, _ = info["samples"]
+                Pb, phb, _sc = fit_local_period(pu_, s0 - 2 * info["period"],
+                                                s0 + seg + 2 * info["period"], info["period"])
+                if phb is not None:
+                    info["bars_per_period"] = bars_per_period(
+                        pu_, s0 - 2 * Pb, s0 + seg + 2 * Pb, Pb)
+                    info["period"] = Pb
+                    p = plan(info["length"], info["height"], Pb, tile, s.model_type,
+                             s.density_min, s.density_max, s.quadrant, s.max_tiles)
+                    info["plan"] = p
+                    used_w, used_h = p["used_w"], p["used_h"]
+                    seg = p["seg_len"]
+                    s0 = phb - Pb / 2 + math.floor((s0 - (phb - Pb / 2)) / Pb) * Pb
+                    info["bar_offset"] = 0.5          # bars sit mid-period in the texture
         else:
             s0 = info["u0"]
         z0 = info["z0"]
@@ -1042,10 +1374,15 @@ class TK_OT_card_make(bpy.types.Operator):
             uv_rect = (rx0 + inset, ry0, rx1 - inset, ry1)
         coll = info["collection"]
         name = info["name"]
+        vrect = _scale_v(uv_rect, used_h, info["height"], p["density"])
         card = build_card_mesh(name, u, z, n, info["u0"], info["u1"], z0,
-                               z0 + info["height"], (info["n0"] + info["n1"]) / 2, s0, seg,
-                               _scale_v(uv_rect, used_h, info["height"], p["density"]),
-                               p["wrap"], coll, mat)
+                               z0 + info["height"], info.get("n_card", (info["n0"] + info["n1"]) / 2), s0, seg,
+                               vrect, p["wrap"], coll, mat)
+        info["texture"] = {"P": info["period"], "k": max(1, p["spans"]), "H": info["height"],
+                           "m": info.get("bars_per_period", 1),
+                           "zprof": z_profile(info, info["z1"], info["height"]),
+                           "uv": vrect, "mat": mat, "density": p["density"], "seg": seg,
+                           "wrap": p["wrap"], "s0": s0}
         return card
 
     def _finish(self, context, s, objs, card, lines, warns):
@@ -1148,7 +1485,7 @@ class TK_OT_card_make(bpy.types.Operator):
         bm = bmesh.new()
         bm.from_mesh(me)
         bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
-        shift = n * ((info["n0"] + info["n1"]) / 2 - nc)
+        shift = n * (info.get("n_card", (info["n0"] + info["n1"]) / 2) - nc)
         for v in bm.verts:
             v.co += shift
         bm.to_mesh(me)
@@ -1206,6 +1543,8 @@ class TK_PT_cards(bpy.types.Panel):
         layout.prop(s, "period_mode")
         if s.period_mode == "MANUAL":
             layout.prop(s, "period")
+        if s.period_mode != "NONE":
+            layout.prop(s, "fit_sections")
         layout.prop(s, "side", expand=True)
 
         box = layout.box()
@@ -1233,6 +1572,15 @@ class TK_PT_cards(bpy.types.Panel):
         r.operator("tk.card_analyse", icon="VIEWZOOM")
         r.scale_y = 1.3
         r.operator("tk.card_make", icon="IMAGE_PLANE")
+        box = layout.box()
+        box.label(text="Комплекс перил (много веток)", icon="OUTLINER_OB_GROUP_INSTANCE")
+        col = box.column(align=True)
+        col.scale_y = 1.2
+        col.operator("tk.card_batch", icon="MOD_ARRAY")
+        if _last_batch:
+            box.label(text=f"Веток {_last_batch['runs']}, карточек {_last_batch['cards']}, "
+                           f"типов {len(_last_batch.get('types', []))}, "
+                           f"не подошло {len(_last_batch['failed'])}")
         if _last["lines"]:
             box = layout.box()
             for ln in _last["lines"]:
@@ -1241,7 +1589,275 @@ class TK_PT_cards(bpy.types.Panel):
                 box.label(text=w, icon="ERROR")
 
 
-classes = (TK_CardSettings, TK_OT_card_analyse, TK_OT_card_make, TK_PT_cards)
+# ---------------------------------------------------------------------------
+# Batch: a whole railing complex → runs → cards sharing one texture
+# ---------------------------------------------------------------------------
+
+def z_profile(info, ztop, H, nb=40):
+    """Where along the height the material is (rails, bars), normalised, top-aligned."""
+    _pu, pz = info["samples"]
+    h, _ = np.histogram(ztop - pz, bins=nb, range=(0.0, H))
+    h = h.astype(float)
+    return h / max(h.sum(), 1e-9)
+
+
+def _rails(h, k=5):
+    """Horizontal members only: peaks of the height profile above its local background
+    (balusters give a flat background whose level depends on their spacing)."""
+    pad = np.pad(h, k, mode="edge")
+    bg = np.array([np.median(pad[i:i + 2 * k + 1]) for i in range(len(h))])
+    r = np.clip(h - bg, 0, None)
+    return r / max(r.max(), 1e-9)
+
+
+def profile_match(a, b):
+    ra, rb = _rails(a), _rails(b)
+    if ra.std() == 0 or rb.std() == 0:
+        return 0.0
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def card_with_texture(context, s, obj, tex, name, coll, info=None):
+    """Card for one run *obj* that reuses an already baked texture *tex*.
+    Returns (card, info) or (None, reason)."""
+    if info is None:
+        info = analyse(context, s)
+    H = tex["H"]
+    if abs(info["height"] - H) > 0.05 * H:
+        return None, f"другая высота ({info['height']:.2f} м против {H:.2f} м)"
+    if info["length"] < 0.5 * tex["P"]:
+        return None, "слишком короткий"
+    zm = profile_match(z_profile(info, info["z1"], H), tex["zprof"])
+    if zm < 0.6:
+        return None, f"другое устройство по высоте (сходство {zm:.2f})"
+    info["bars_per_period"] = tex["m"]
+    u, z, n = info["u"], info["z"], info["n"]
+    z1 = info["z1"]
+    Hc = min(H, info["height"])                     # a lower railing crops, never stretches
+    z0 = z1 - Hc                                    # align the handrail (top of the band)
+    k = tex["k"]
+    ux0, uy0, ux1, uy1 = tex["uv"]
+    vrect = (ux0, uy1 - (uy1 - uy0) * Hc / H, ux1, uy1)
+    card = build_card_mesh(name, u, z, n, info["u0"], info["u1"], z0, z1,
+                           info.get("n_card", (info["n0"] + info["n1"]) / 2), info["u0"], tex["seg"],
+                           vrect, True, coll, tex["mat"])
+    if info["profile"] is not None:
+        warp_to_profile(card, info)
+    info["plan"]["spans"] = k
+    info["bar_offset"] = 0.5
+    if tex.get("tb") is not None:
+        info["texture"] = {"tb": tex["tb"], "m": tex.get("m", 1)}   # measured bar positions
+    secs = fit_sections(info, tex["P"], tex["m"])
+    good = [x for x in secs if x["score"] > 2.0]
+    if not good:
+        bpy.data.meshes.remove(card.data)
+        return None, "шаг стоек не совпадает с текстурой"
+    info["period"] = tex["P"]
+    fit_card_uvs(card, info)
+    return card, info
+
+
+class TK_OT_card_batch(bpy.types.Operator):
+    bl_idname = "tk.card_batch"
+    bl_label = "Перила целиком"
+    bl_description = ("Разобрать выделенный комплекс перил на отдельные ветки, запечь одну общую "
+                      "текстуру с самой длинной ветки и поставить карточки на все ветки")
+    bl_options = {"REGISTER", "UNDO"}
+
+    min_length: FloatProperty(name="Короче — оставить геометрией", default=1.0, min=0.0,
+                              subtype="DISTANCE")
+    join: BoolProperty(name="Собрать карточки в один объект", default=True)
+    max_types: bpy.props.IntProperty(name="Максимум типов перил (текстур)", default=6, min=1,
+                                     max=16)
+
+    def execute(self, context):
+        from . import runs as RU
+        s = context.scene.tk_card
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        srcs = [o for o in context.selected_objects if o.type == "MESH"]
+        if not srcs:
+            self.report({"WARNING"}, "Выделите меш с перилами")
+            return {"CANCELLED"}
+        wm = context.window_manager
+        coll = srcs[0].users_collection[0] if srcs[0].users_collection else context.scene.collection
+        run_objs, leftovers = [], []
+        for src in srcs:
+            me = src.data
+            nv = len(me.vertices)
+            co = np.empty(nv * 3)
+            me.vertices.foreach_get("co", co)
+            mw = np.array([list(r) for r in src.matrix_world])
+            W = co.reshape(-1, 3) @ mw[:3, :3].T + mw[:3, 3]
+            lab, parts, lines, runs, left = RU.analyse_mesh(W, me)
+            npoly = len(me.polygons)
+            ls_ = np.empty(npoly, np.int64)
+            me.polygons.foreach_get("loop_start", ls_)
+            lv = np.empty(len(me.loops), np.int64)
+            me.loops.foreach_get("vertex_index", lv)
+            plab = lab[lv[ls_]]
+            part_run = np.array([p.run for p in parts])
+            keep = np.zeros(len(parts), bool)        # parts that stay geometry
+            for i, r in enumerate(runs):
+                if r["u1"] - r["u0"] < self.min_length:
+                    keep[[p.idx for p in r["parts"]]] = True
+                    continue
+                sub = RU.submesh(me, part_run[plab] == i, f"{src.name}_run{i}")
+                o = bpy.data.objects.new(f"{src.name}_run{i}", sub)
+                o.matrix_world = src.matrix_world
+                context.scene.collection.objects.link(o)
+                run_objs.append((o, r, src, i))
+            for p in left:
+                keep[p.idx] = True
+            leftovers.append((src, keep[plab] if len(keep) else None, part_run, plab))
+        if not run_objs:
+            self.report({"WARNING"}, "Не нашлось веток длиннее порога")
+            return {"CANCELLED"}
+
+        def select_only(o):
+            C.deselect_all(context.view_layer)
+            o.hide_set(False)
+            o.select_set(True)
+            context.view_layer.objects.active = o
+
+        # quick look at every run: height and where the rails are
+        run_objs.sort(key=lambda t: -(t[1]["u1"] - t[1]["u0"]))
+        for o, *_ in run_objs:
+            o.hide_set(True)
+        prev = (s.originals, s.period_mode, s.atlas_name)
+        quick = {}
+        s.period_mode = "NONE"
+        try:
+            for o, *_ in run_objs:
+                select_only(o)
+                inf = analyse(context, s)
+                o.hide_set(True)
+                # a railing band is not taller than ~2.5 m; taller means the profile
+                # wasn't found (or it isn't a railing) — such runs stay geometry
+                quick[o.name] = (inf["height"], inf, inf["height"] < 2.5)
+        finally:
+            s.period_mode = prev[1]
+
+        # group runs into railing types; the longest run of a type is its master
+        groups = []                     # dicts: master, tex, members
+        cards, failed = [], []
+        wm.progress_begin(0, len(run_objs))
+        s.originals = "KEEP"
+        s.period_mode = "AUTO"
+        try:
+            for j, (o, r, src, i) in enumerate(run_objs):
+                wm.progress_update(j)
+                H, inf, plausible = quick[o.name]
+                home, best = None, 0.0
+                for g in groups:
+                    gH = g["H"]
+                    if abs(H - gH) > 0.03 * gH:
+                        continue
+                    mt = profile_match(z_profile(inf, inf["z1"], gH), g["tex"]["zprof"])
+                    if mt >= 0.7 and mt > best:
+                        home, best = g, mt
+                if home is not None:
+                    select_only(o)
+                    card, why = card_with_texture(context, s, o, home["tex"],
+                                                  f"{src.name}_card{i}", coll, info=inf)
+                    o.hide_set(True)
+                    if card is not None:
+                        cards.append(card)
+                        home["n"] += 1
+                        continue
+                    failed.append((o.name, why))
+                    continue
+                if not plausible or len(groups) >= self.max_types:
+                    failed.append((o.name, "высота больше 2,5 м — профиль не распознан" if not plausible
+                                   else "слишком много типов перил"))
+                    continue
+                # a new railing type: bake it
+                gname = s.atlas_name if not groups else f"{prev[2]}_{len(groups) + 1}"
+                s.atlas_name = gname
+                select_only(o)
+                res = bpy.ops.tk.card_make()
+                mc = context.view_layer.objects.active
+                o.hide_set(True)
+                tex = _last_texture.get("tex")
+                if "FINISHED" not in res or mc is o or tex is None:
+                    if "FINISHED" in res and mc is not o and mc is not None:
+                        bpy.data.objects.remove(mc)
+                    failed.append((o.name, "не тайлится (нет повторяющихся стоек)"))
+                    continue
+                cards.append(mc)
+                groups.append({"H": tex["H"], "tex": tex, "n": 1, "atlas": gname})
+        finally:
+            s.originals, s.period_mode, s.atlas_name = prev
+        wm.progress_end()
+        if not cards:
+            self.report({"ERROR"}, "Ни одна ветка не превратилась в карточку")
+            return {"CANCELLED"}
+
+        # leftovers: parts not converted (short runs, unassigned, failed runs) stay as geometry
+        failed_ids = {}
+        for oname, why in failed:
+            src_name = oname.split("_run")[0]
+            failed_ids.setdefault(src_name, []).append(int(oname.rsplit("_run", 1)[1]))
+        rest_objs = []
+        for src, keepmask, part_run, plab in leftovers:
+            mask = keepmask.copy() if keepmask is not None else np.zeros(len(src.data.polygons), bool)
+            for ri in failed_ids.get(src.name, []):
+                mask |= part_run[plab] == ri
+            if mask.any():
+                me2 = RU.submesh(src.data, mask, f"{src.name}_остаток")
+                ro = bpy.data.objects.new(f"{src.name}_остаток", me2)
+                ro.matrix_world = src.matrix_world
+                coll.objects.link(ro)
+                rest_objs.append(ro)
+            src.hide_set(True)
+            src.hide_render = True
+        for o, *_ in run_objs:
+            me_ = o.data
+            bpy.data.objects.remove(o)
+            if me_.users == 0:
+                bpy.data.meshes.remove(me_)
+
+        for c in cards:
+            if c.name not in coll.objects:
+                for uc in list(c.users_collection):
+                    uc.objects.unlink(c)
+                coll.objects.link(c)
+        result = cards
+        if self.join and len(cards) > 1:
+            C.deselect_all(context.view_layer)
+            for c in cards:
+                c.select_set(True)
+            context.view_layer.objects.active = cards[0]
+            with context.temp_override(active_object=cards[0], selected_editable_objects=cards,
+                                       selected_objects=cards):
+                bpy.ops.object.join()
+            joined = context.view_layer.objects.active
+            joined.name = f"{srcs[0].name}_карточки"
+            result = [joined]
+        C.deselect_all(context.view_layer)
+        for c in result + rest_objs:
+            c.select_set(True)
+        context.view_layer.objects.active = result[0]
+        tri = sum(len(c.data.polygons) for c in result)
+        rest = sum(len(c.data.polygons) for c in rest_objs)
+        _last_batch.update(runs=len(run_objs), cards=len(cards), failed=list(failed),
+                           card_polys=tri, rest_polys=rest,
+                           types=[(g["atlas"], g["n"], round(g["H"], 2)) for g in groups])
+        msg = (f"Веток: {len(run_objs)}, карточек: {len(cards)}, типов перил: {len(groups)}, "
+               f"полигонов в карточках: {tri}; "
+               f"оставлено геометрией: {rest} полигонов")
+        if failed:
+            msg += f"; не подошли {len(failed)} (оставлены геометрией)"
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+_last_texture = {}
+_last_batch = {}
+_SAMPLES = {"n": 200000}
+
+
+classes = (TK_CardSettings, TK_OT_card_analyse, TK_OT_card_make, TK_OT_card_batch, TK_PT_cards)
 
 
 def register():
@@ -1254,3 +1870,5 @@ def unregister():
     del bpy.types.Scene.tk_card
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
+
+

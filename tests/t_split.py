@@ -42,3 +42,15 @@ for fmt in ("FBX","OBJ","GLB"):
     s.export_format=fmt; [o.select_set(o.name.startswith("Box_")) for o in bpy.data.objects]
     r=bpy.ops.tk.split_export(); print(fmt, r)
 print(sorted(os.listdir(d)))
+# highlight of the chosen material in the viewport (geometry part; drawing needs a GPU)
+for o in list(bpy.data.objects): bpy.data.objects.remove(o)
+ob, ms = setup(); s.mode = "ACTIVE"; ob.active_material_index = 1
+sets = S.highlight_sets(ob, s); print("highlight sets", sets)
+assert len(sets) == 1 and sets[0][1] == {1}
+nface = sum(1 for p in ob.data.polygons if p.material_index == 1)
+tris, seg = S.material_region(ob, bpy.context.evaluated_depsgraph_get(), {1})
+print("highlight", nface, "faces ->", len(tris), "tri verts,", len(seg), "outline verts")
+assert len(tris) == nface * 2 * 3 and len(seg) > 0
+s.mode = "PICKED"; ms[2].tk_split_pick = True
+sets = S.highlight_sets(ob, s); print("picked sets", sets)
+assert {frozenset(x[1]) for x in sets} == {frozenset({1}), frozenset({2})}

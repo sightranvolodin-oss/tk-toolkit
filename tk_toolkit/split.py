@@ -44,6 +44,11 @@ class TK_SplitSettings(bpy.types.PropertyGroup):
         name="Экспорт в начале координат", default=False,
         description="На время экспорта ставить кусок в (0,0,0)")
 
+    highlight: BoolProperty(
+        name="Подсветка материала", default=True,
+        description="Подсвечивать во вьюпорте геометрию выбранного в списке материала "
+                    "(и отмеченных галочками)",
+        update=lambda self, ctx: C.tag_redraw_3d())
     weld_distance: FloatProperty(name="Сварка швов", default=1e-5, min=0.0, soft_max=0.01,
                                  subtype="DISTANCE", precision=6,
                                  description="При сборке сливать совпадающие вершины на швах")
@@ -429,6 +434,7 @@ class TK_PT_split(bpy.types.Panel):
         ob = context.active_object
         layout.prop(s, "mode", expand=True)
         if ob is not None and ob.type == "MESH":
+            layout.prop(s, "highlight", icon="LIGHT_SUN")
             layout.template_list("TK_UL_split_slots", "", ob, "material_slots", ob,
                                  "active_material_index", rows=4)
             if s.mode == "PICKED":
@@ -461,15 +467,159 @@ classes = (TK_SplitSettings, TK_OT_split_by_material, TK_OT_split_export, TK_OT_
            TK_OT_split_pick_all, TK_UL_split_slots, TK_PT_split)
 
 
+# ---------------------------------------------------------------------------
+# Highlight of the chosen material in the viewport
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+COL_ACTIVE = (0.2, 0.85, 1.0)     # material selected in the list
+COL_PICKED = (1.0, 0.55, 0.1)     # materials ticked for extraction
+
+_hl = {"handle": None, "key": None, "batches": [], "geo": {}}
+
+
+def highlight_sets(ob, s):
+    """[(color, set_of_slot_indices)] to draw for *ob*."""
+    out = []
+    picked = set()
+    if s.mode == "PICKED":
+        picked = {i for i, sl in enumerate(ob.material_slots)
+                  if sl.material is not None and sl.material.tk_split_pick}
+    act = ob.active_material_index
+    if picked:
+        out.append((COL_PICKED, picked - {act}))
+    if 0 <= act < len(ob.material_slots):
+        out.append((COL_ACTIVE, {act}))
+    return [(c, sl) for c, sl in out if sl]
+
+
+def material_region(ob, depsgraph, slots):
+    """World-space triangles and outline segments of the faces using *slots*."""
+    ev = ob.evaluated_get(depsgraph)
+    me = ev.to_mesh()
+    try:
+        me.calc_loop_triangles()
+        npoly = len(me.polygons)
+        if npoly == 0:
+            return None, None
+        mi = np.empty(npoly, np.int32)
+        me.polygons.foreach_get("material_index", mi)
+        nsl = max(1, len(ob.material_slots))
+        mi = np.clip(mi, 0, nsl - 1)
+        sel = np.isin(mi, list(slots))
+        if not sel.any():
+            return None, None
+        nv = len(me.vertices)
+        co = np.empty(nv * 3, np.float32)
+        me.vertices.foreach_get("co", co)
+        co = co.reshape(-1, 3)
+        try:
+            vn = np.empty(nv * 3, np.float32)
+            me.vertex_normals.foreach_get("vector", vn)
+        except AttributeError:
+            me.vertices.foreach_get("normal", vn)
+        vn = vn.reshape(-1, 3)
+        nt = len(me.loop_triangles)
+        tris = np.empty(nt * 3, np.int64)
+        me.loop_triangles.foreach_get("vertices", tris)
+        tris = tris.reshape(-1, 3)
+        tpoly = np.empty(nt, np.int64)
+        me.loop_triangles.foreach_get("polygon_index", tpoly)
+        tris = tris[sel[tpoly]]
+        # boundary of the region: edges used by exactly one selected polygon
+        ls = np.empty(npoly, np.int64)
+        lt = np.empty(npoly, np.int64)
+        me.polygons.foreach_get("loop_start", ls)
+        me.polygons.foreach_get("loop_total", lt)
+        lv = np.empty(len(me.loops), np.int64)
+        me.loops.foreach_get("vertex_index", lv)
+        pol = np.repeat(np.arange(npoly), lt)
+        li = np.arange(len(lv))
+        nxt = ls[pol] + (li - ls[pol] + 1) % lt[pol]
+        m = sel[pol]
+        a, b = lv[li[m]], lv[nxt[m]]
+        e = np.sort(np.stack([a, b], 1), axis=1)
+        uniq, cnt = np.unique(e, axis=0, return_counts=True)
+        edges = uniq[cnt == 1]
+        mw = np.array([list(r) for r in ob.matrix_world], np.float32)
+        wco = co @ mw[:3, :3].T + mw[:3, 3]
+        n3 = np.linalg.inv(mw[:3, :3]).T
+        wn = vn @ n3.T
+        wn /= np.maximum(np.linalg.norm(wn, axis=1, keepdims=True), 1e-9)
+        diag = float(np.linalg.norm(wco.max(0) - wco.min(0))) or 1.0
+        push = wco + wn * diag * 2e-4            # lift over the surface: no z-fighting
+        return push[tris.reshape(-1)], push[edges.reshape(-1)]
+    finally:
+        ev.to_mesh_clear()
+
+
+def _hl_key(ob, s):
+    return (ob.name, s.mode, tuple(sorted((tuple(c), tuple(sorted(sl)))
+                                          for c, sl in highlight_sets(ob, s))),
+            _hl["geo"].get(ob.name, 0), tuple(round(x, 6) for r in ob.matrix_world for x in r))
+
+
+def _hl_draw():
+    ctx = bpy.context
+    try:
+        s = ctx.scene.tk_split
+    except AttributeError:
+        return
+    ob = ctx.active_object
+    if not s.highlight or ob is None or ob.type != "MESH" or ctx.mode != "OBJECT" \
+            or not ob.visible_get() or len(ob.material_slots) == 0:
+        return
+    key = _hl_key(ob, s)
+    if key != _hl["key"]:
+        _hl["key"] = key
+        _hl["batches"] = []
+        dg = ctx.evaluated_depsgraph_get()
+        for col, slots in highlight_sets(ob, s):
+            tri, seg = material_region(ob, dg, slots)
+            if tri is None:
+                continue
+            _hl["batches"].append((col, C.make_batch("uniform", "TRIS", tri),
+                                   C.make_batch("uniform", "LINES", seg)))
+    if not _hl["batches"]:
+        return
+    with C.GPUState(depth=False):                 # outline seen through everything
+        for col, _f, edges in _hl["batches"]:
+            C.draw_batch(edges, (*col, 0.35), 1.5)
+    with C.GPUState(depth=True):
+        for col, fill, edges in _hl["batches"]:
+            C.draw_batch(fill, (*col, 0.28))
+            C.draw_batch(edges, (*col, 1.0), 2.5)
+
+
+@bpy.app.handlers.persistent
+def _hl_depsgraph(scene, depsgraph):
+    for u in depsgraph.updates:
+        if isinstance(u.id, bpy.types.Object) and u.is_updated_geometry:
+            name = u.id.original.name if hasattr(u.id, "original") else u.id.name
+            _hl["geo"][name] = _hl["geo"].get(name, 0) + 1
+
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.tk_split = PointerProperty(type=TK_SplitSettings)
     bpy.types.Material.tk_split_pick = BoolProperty(
-        name="Вытащить", default=False, description="Вытащить этот материал в отдельный объект")
+        name="Вытащить", default=False, description="Вытащить этот материал в отдельный объект",
+        update=lambda self, ctx: C.tag_redraw_3d())
+    bpy.app.handlers.depsgraph_update_post.append(_hl_depsgraph)
+    if C.can_draw():
+        _hl["handle"] = bpy.types.SpaceView3D.draw_handler_add(_hl_draw, (), "WINDOW", "POST_VIEW")
 
 
 def unregister():
+    if _hl["handle"] is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_hl["handle"], "WINDOW")
+        _hl["handle"] = None
+    if _hl_depsgraph in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_hl_depsgraph)
+    _hl["batches"] = []
+    _hl["key"] = None
     del bpy.types.Material.tk_split_pick
     del bpy.types.Scene.tk_split
     for c in reversed(classes):

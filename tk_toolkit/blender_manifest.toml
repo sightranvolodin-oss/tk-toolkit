@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "tk_toolkit"
-version = "0.4.0"
+version = "0.5.0"
 name = "TK Toolkit"
 tagline = "Bake preview, retopology, maps & atlas, split by material"
 maintainer = "TK Toolkit"
