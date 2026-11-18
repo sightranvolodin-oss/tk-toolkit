@@ -8,7 +8,7 @@ Sidebar (N) → tab «Toolkit».
 bl_info = {
     "name": "TK Toolkit",
     "author": "TK Toolkit",
-    "version": (0, 7, 2),
+    "version": (0, 7, 1),
     "blender": (4, 2, 0),
     "location": "3D Viewport → Sidebar (N) → Toolkit",
     "description": "Bake preview, retopology, texture maps & atlas, split by material, layers and more",
