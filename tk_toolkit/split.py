@@ -388,6 +388,142 @@ class TK_OT_split_join(bpy.types.Operator):
         return {"FINISHED"}
 
 
+import re as _re
+
+
+def _img_key(img):
+    if img is None:
+        return None
+    fp = bpy.path.abspath(img.filepath) if img.filepath else ""
+    return fp or _re.sub(r"\.\d{3}$", "", img.name)
+
+
+def _val(v, tol):
+    """default_value → rounded, hashable."""
+    try:
+        seq = list(v)
+    except TypeError:
+        seq = None
+    if seq is None:
+        if isinstance(v, (int, float, bool)):
+            return round(float(v) / tol)
+        return str(v)
+    return tuple(round(float(x) / tol) if isinstance(x, (int, float)) else str(x) for x in seq)
+
+
+def material_signature(m, tol=0.01):
+    """What a material IS (nodes, values, textures, links), not what it is called: two
+    copies 'Metal', 'Metal.001' from an import get the same signature."""
+    if m is None:
+        return ("NONE",)
+    if not m.use_nodes or m.node_tree is None:
+        return ("FLAT", _val(m.diffuse_color, tol), _val(m.metallic, tol),
+                _val(m.roughness, tol))
+    nodes = []
+    for n in m.node_tree.nodes:
+        if n.bl_idname in ("NodeFrame", "NodeReroute"):
+            continue
+        ins = tuple((i.identifier, _val(i.default_value, tol)) for i in n.inputs
+                    if not i.is_linked and hasattr(i, "default_value"))
+        extra = []
+        if getattr(n, "image", None) is not None:
+            extra.append(("img", _img_key(n.image)))
+        for attr in ("blend_type", "operation", "data_type", "interpolation", "projection",
+                     "extension", "space", "uv_map", "distribution", "subsurface_method"):
+            if hasattr(n, attr):
+                extra.append((attr, str(getattr(n, attr))))
+        nodes.append((n.bl_idname, ins, tuple(extra)))
+    links = sorted((l.from_node.bl_idname, l.from_socket.identifier, l.to_node.bl_idname,
+                    l.to_socket.identifier) for l in m.node_tree.links)
+    return ("NODES", tuple(sorted(nodes, key=repr)), tuple(links),
+            m.blend_method if hasattr(m, "blend_method") else "")
+
+
+def merge_duplicate_slots(ob, tol=0.01):
+    """Collapse material slots with identical content into one slot each. Returns
+    (n_before, n_after, {kept_slot: [names merged into it]})."""
+    me = ob.data
+    mats = list(me.materials)
+    if len(mats) < 2:
+        return len(mats), len(mats), {}
+    sig = [material_signature(m, tol) for m in mats]
+    first, new_mats, remap, groups = {}, [], [], {}
+    for i, sgn in enumerate(sig):
+        if sgn not in first:
+            first[sgn] = len(new_mats)
+            new_mats.append(mats[i])
+        k = first[sgn]
+        remap.append(k)
+        groups.setdefault(k, []).append(mats[i].name if mats[i] else "—")
+    if len(new_mats) == len(mats):
+        return len(mats), len(mats), {}
+    mi = np.empty(len(me.polygons), np.int32)
+    me.polygons.foreach_get("material_index", mi)
+    mi = np.array(remap, np.int32)[np.clip(mi, 0, len(remap) - 1)]
+    me.materials.clear()
+    for m in new_mats:
+        me.materials.append(m)
+    me.polygons.foreach_set("material_index", mi)
+    me.update()
+    return len(mats), len(new_mats), {k: v for k, v in groups.items() if len(v) > 1}
+
+
+class TK_OT_split_merge_same(bpy.types.Operator):
+    bl_idname = "tk.split_merge_same"
+    bl_label = "Объединить одинаковые материалы"
+    bl_description = ("Материалы с одинаковым содержимым (цвет, металл, шероховатость, "
+                      "текстуры, ноды) сводятся в один слот — даже если называются по-разному. "
+                      "Потом их можно вытащить одним куском")
+    bl_options = {"REGISTER", "UNDO"}
+
+    tolerance: bpy.props.FloatProperty(name="Допуск значений", default=0.01, min=0.0001,
+                                       max=0.5, description="Значения, отличающиеся меньше "
+                                       "допуска, считаются одинаковыми")
+    extract: bpy.props.BoolProperty(name="Сразу вытащить самый большой набор", default=False,
+                                    description="После объединения отделить в свой объект "
+                                                "материал, в который слилось больше всего копий")
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == "MESH" for o in context.selected_objects)
+
+    def execute(self, context):
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        tot_b = tot_a = 0
+        best = None
+        for ob in [o for o in context.selected_objects if o.type == "MESH"]:
+            b, a, groups = merge_duplicate_slots(ob, self.tolerance)
+            tot_b += b
+            tot_a += a
+            for k, names in groups.items():
+                if best is None or len(names) > best[2]:
+                    best = (ob, k, len(names), names)
+        if tot_b == tot_a:
+            self.report({"INFO"}, "Одинаковых материалов не нашлось")
+            return {"FINISHED"}
+        msg = f"Слотов было {tot_b}, стало {tot_a}"
+        if best is not None:
+            ob, k, n, names = best
+            context.view_layer.objects.active = ob
+            ob.active_material_index = k
+            msg += f"; больше всего слилось в «{names[0]}» ({n} шт.) — он выбран в списке"
+            if self.extract:
+                s = context.scene.tk_split
+                old = s.mode
+                s.mode = "ACTIVE"
+                for o in context.selected_objects:
+                    o.select_set(False)
+                ob.select_set(True)
+                try:
+                    bpy.ops.tk.split_by_material()
+                finally:
+                    s.mode = old
+                msg += " и вытащен в отдельный объект"
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
 class TK_OT_split_pick_all(bpy.types.Operator):
     bl_idname = "tk.split_pick_all"
     bl_label = "Отметить все"
@@ -432,6 +568,7 @@ class TK_PT_split(bpy.types.Panel):
         s = context.scene.tk_split
         layout = self.layout
         ob = context.active_object
+        layout.operator("tk.split_merge_same", icon="MATERIAL")
         layout.prop(s, "mode", expand=True)
         if ob is not None and ob.type == "MESH":
             layout.prop(s, "highlight", icon="LIGHT_SUN")
@@ -464,7 +601,7 @@ class TK_PT_split(bpy.types.Panel):
 
 
 classes = (TK_SplitSettings, TK_OT_split_by_material, TK_OT_split_export, TK_OT_split_join,
-           TK_OT_split_pick_all, TK_UL_split_slots, TK_PT_split)
+           TK_OT_split_merge_same, TK_OT_split_pick_all, TK_UL_split_slots, TK_PT_split)
 
 
 # ---------------------------------------------------------------------------
